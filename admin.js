@@ -79,6 +79,7 @@ async function getAdminMenuMessageAndKeyboard() {
 
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback('➕ Tambah Stok', 'admin_add_stock_select_product_1')],
+    [Markup.button.callback('➖ Ambil Stok', 'admin_take_stock_select_product_1')],
     [Markup.button.callback('➕ Tambah Produk', 'admin_add_product')],
     [Markup.button.callback('✍️ Edit Produk', 'admin_edit_product_list_1')],
     [Markup.button.callback('💰 Harga Grosir', 'admin_bulk_select_product_1')],
@@ -276,6 +277,97 @@ async function getAddStockVariantList(productId, page = 1) {
     message,
     keyboard: Markup.inlineKeyboard(keyboard)
   };
+}
+
+/* ========================= AMBIL STOK ========================= */
+async function getTakeStockProductList(page = 1) {
+  const products = await Product.find({}).sort({ name: 1 }).lean();
+  const productsPerPage = 5;
+  const startIndex = (page - 1) * productsPerPage;
+  const endIndex = startIndex + productsPerPage;
+  const paginatedProducts = products.slice(startIndex, endIndex);
+
+  let message = '👇 *Ambil Stok*\n\nPilih produk yang stoknya akan diambil:\n\n';
+  const keyboardButtons = [];
+  paginatedProducts.forEach((p, index) => {
+    const productNumber = startIndex + index + 1;
+    message += `*${productNumber}. ${p.name}*\n`;
+    keyboardButtons.push(Markup.button.callback(String(productNumber), `admin_take_stock_select_variant_${p.id}_1`));
+  });
+
+  const navigationButtons = [];
+  if (page > 1) navigationButtons.push(Markup.button.callback('⬅️', `admin_take_stock_select_product_${page - 1}`));
+  if (endIndex < products.length) navigationButtons.push(Markup.button.callback('➡️', `admin_take_stock_select_product_${page + 1}`));
+
+  return {
+    message,
+    keyboard: Markup.inlineKeyboard([keyboardButtons, navigationButtons, [Markup.button.callback('⬅️ Batal', 'admin_menu')]])
+  };
+}
+
+async function getTakeStockVariantList(productId, page = 1) {
+  const product = await Product.findOne({ id: productId }).lean();
+  if (!product) return { message: '❌ Produk tidak ditemukan.', keyboard: Markup.inlineKeyboard([[Markup.button.callback('⬅️ Kembali', 'admin_menu')]]) };
+
+  const variantsPerPage = 5;
+  const startIndex = (page - 1) * variantsPerPage;
+  const endIndex = startIndex + variantsPerPage;
+  const paginatedVariants = product.variants.slice(startIndex, endIndex);
+
+  const message = `👇 *Ambil Stok: ${product.name}*\n\nPilih varian yang stoknya akan diambil:`;
+  const keyboardButtons = paginatedVariants.map(v => {
+    const stockCount = Array.isArray(v.stock) ? v.stock.length : 0;
+    return [Markup.button.callback(`${v.name} (Stok: ${stockCount})`, `admin_take_stock_final:${product.id}:${v.slug}`)];
+  });
+
+  const navigationButtons = [];
+  if (page > 1) navigationButtons.push(Markup.button.callback('⬅️', `admin_take_stock_select_variant_${productId}_${page - 1}`));
+  if (endIndex < product.variants.length) navigationButtons.push(Markup.button.callback('➡️', `admin_take_stock_select_variant_${productId}_${page + 1}`));
+
+  return {
+    message,
+    keyboard: Markup.inlineKeyboard([...keyboardButtons, navigationButtons, [Markup.button.callback('⬅️ Kembali ke Produk', 'admin_take_stock_select_product_1')]])
+  };
+}
+
+/** Ambil (keluarkan) sejumlah stok dari sebuah varian dan kirimkan ke admin. */
+async function takeStock(productId, variantSlug, count, ctx) {
+  try {
+    const numCount = parseInt(count, 10);
+    if (isNaN(numCount) || numCount <= 0) {
+      return ctx.reply('❌ Jumlah tidak valid. Kirim angka lebih dari 0.');
+    }
+    const product = await Product.findOne({ id: productId });
+    if (!product) return ctx.reply('❌ Produk tidak ditemukan.');
+    const variant = product.variants.find(v => v.slug === variantSlug);
+    if (!variant) return ctx.reply('❌ Varian tidak ditemukan.');
+
+    const tersedia = Array.isArray(variant.stock) ? variant.stock.length : 0;
+    if (tersedia < numCount) {
+      return ctx.reply(`❌ Stok tidak cukup. Tersedia ${tersedia}, diminta ${numCount}.`);
+    }
+
+    // Ambil dari awal array lalu simpan (varian bukan .lean(), jadi bisa disave).
+    const taken = variant.stock.splice(0, numCount);
+    await product.save();
+
+    const header = `✅ *Berhasil ambil ${numCount} stok*\n` +
+      `*Produk:* ${product.name}\n*Varian:* ${variant.name}\n*Sisa stok:* ${variant.stock.length}\n`;
+
+    if (numCount <= 20) {
+      const list = taken.map((it, i) => `${i + 1}. ${it}`).join('\n');
+      await ctx.reply(header + '\n```\n' + list + '\n```', { parse_mode: 'Markdown' });
+    } else {
+      await ctx.reply(header, { parse_mode: 'Markdown' });
+      await ctx.replyWithDocument({
+        source: Buffer.from(taken.join('\n'), 'utf-8'),
+        filename: `ambil_${variantSlug}_${Date.now()}.txt`
+      });
+    }
+  } catch (error) {
+    console.error('takeStock error:', error);
+    await ctx.reply('❌ Terjadi kesalahan saat mengambil stok.');
+  }
 }
 
 
@@ -733,6 +825,44 @@ bot.action('confirm_transfer_no', adminMiddleware, async (ctx) => {
       }
     });
 
+  /* ===== Ambil Stok ===== */
+  bot.action(/^admin_take_stock_select_product_(\d+)$/, adminMiddleware, async (ctx) => {
+    await ctx.answerCbQuery();
+    const page = parseInt(ctx.match[1]);
+    const { message, keyboard } = await getTakeStockProductList(page);
+    await ctx.editMessageText(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+  });
+
+  bot.action(/^admin_take_stock_select_variant_(.+?)_(\d+)$/, adminMiddleware, async (ctx) => {
+    await ctx.answerCbQuery();
+    const productId = ctx.match[1];
+    const page = parseInt(ctx.match[2]);
+    const { message, keyboard } = await getTakeStockVariantList(productId, page);
+    await ctx.editMessageText(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+  });
+
+  bot.action(/^admin_take_stock_final:(.+?):(.*)$/, adminMiddleware, async (ctx) => {
+    try {
+      await ctx.answerCbQuery();
+      const productId = ctx.match[1];
+      const variantSlug = ctx.match[2];
+      const product = await Product.findOne({ id: productId }).lean();
+      if (!product) return await ctx.editMessageText(`❌ Produk "${productId}" tidak ditemukan.`);
+      const variant = product.variants.find(v => v.slug === variantSlug);
+      if (!variant) return await ctx.editMessageText(`❌ Varian "${variantSlug}" tidak ditemukan.`);
+
+      userStates[ctx.from.id] = { state: 'awaiting_take_stock_count', productId, variantSlug };
+
+      const stok = Array.isArray(variant.stock) ? variant.stock.length : 0;
+      const message = `➖ *Ambil Stok*\n*Produk:* ${product.name}\n*Varian:* ${variant.name}\n*Stok tersedia:* ${stok}\n\nKetik JUMLAH stok yang ingin diambil (angka):`;
+      const keyboard = Markup.inlineKeyboard([Markup.button.callback('⬅️ Batal', `admin_take_stock_select_variant_${productId}_1`)]);
+      await ctx.editMessageText(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+    } catch (error) {
+      console.error('Error in admin_take_stock_final:', error);
+      await ctx.editMessageText('❌ Terjadi kesalahan internal saat memproses pilihan varian.');
+    }
+  });
+
   bot.action(/^admin_edit_product_list_(\d+)$/,
     adminMiddleware,
     async (ctx) => {
@@ -990,5 +1120,6 @@ bot.action('confirm_transfer_no', adminMiddleware, async (ctx) => {
 
 module.exports.getAdminMenuMessageAndKeyboard = getAdminMenuMessageAndKeyboard;
 module.exports.addStock = addStock;
+module.exports.takeStock = takeStock;
 module.exports.userStates = userStates;
 module.exports.adminMiddleware = adminMiddleware;

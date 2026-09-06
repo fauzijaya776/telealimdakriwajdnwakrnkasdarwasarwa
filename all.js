@@ -21,6 +21,7 @@ const moment = require('moment-timezone');
 const { connectDB, User, Product, Order, Settings, slimPaymentDetails } = require('./db');
 const dana = require('./qris_dana');
 const tokopay = require('./qris_tokopay');
+const qrin = require('./qris_qrin');
 const linkqu = require('./qris_linkqu');
 const adminModule = require('./admin');
 const QRCode = require('qrcode');
@@ -206,7 +207,8 @@ app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 
 app.use(bodyParser.urlencoded({ extended: true }));
-app.use(bodyParser.json());
+// verify: simpan body mentah untuk validasi tanda tangan webhook QRIN.
+app.use(bodyParser.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(session({
     secret: 'telegram-bot-admin-secret-key-super-aman',
     resave: false,
@@ -249,6 +251,13 @@ app.get('/logout', (req, res) => {
 // --- Rute API untuk MENGAMBIL stok ---
 app.post('/api/take-stock', async (req, res) => {
     try {
+        // Keamanan: wajib menyertakan kunci yang cocok dengan STOCK_API_KEY (.env).
+        // Kirim lewat header 'X-API-Key' atau field 'api_key' di body.
+        const kunci = req.headers['x-api-key'] || (req.body && req.body.api_key);
+        if (!process.env.STOCK_API_KEY || kunci !== process.env.STOCK_API_KEY) {
+            return res.status(401).json({ error: 'Unauthorized: API key tidak valid.' });
+        }
+
         const { productId, variantSlug, count } = req.body;
 
         // Validasi input
@@ -301,6 +310,12 @@ app.post('/api/take-stock', async (req, res) => {
 
 app.post('/api/return-stock', async (req, res) => {
     try {
+        // Keamanan: wajib menyertakan kunci yang cocok dengan STOCK_API_KEY (.env).
+        const kunci = req.headers['x-api-key'] || (req.body && req.body.api_key);
+        if (!process.env.STOCK_API_KEY || kunci !== process.env.STOCK_API_KEY) {
+            return res.status(401).json({ error: 'Unauthorized: API key tidak valid.' });
+        }
+
         const { productId, variantSlug, stockItems } = req.body;
 
         // Validasi input
@@ -1795,21 +1810,20 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         const orderDetails = { productId, variantSlug, productName: product.name, variantName: variant.name, quantity, reservedItems };
         const customerInfo = { telegramUserId: ctx.from.id.toString(), first_name: ctx.from.first_name };
 
-        const rawPayment = await tokopay.createTransaction(internalOrderId, totalHarga);
-        console.log("[DOMPETX] Raw payment response:", JSON.stringify(rawPayment, null, 2));
+        const rawPayment = await qrin.createTransaction(internalOrderId, totalHarga, product.name);
+        console.log("[QRIN] Raw payment response:", JSON.stringify(rawPayment, null, 2));
 
         const payment = {
             displayOrderId: rawPayment.displayOrderId,
             realOrderId: rawPayment.realOrderId,
             qrString: rawPayment.qrString,
-            qrImage: rawPayment.qrImage,
             amount: rawPayment.amount,
             totalBayar: rawPayment.totalBayar,
             fee: rawPayment.fee,
-            expiredAt: rawPayment.expiredAt,
+            validity: rawPayment.validity,
         };
 
-        if (!payment.qrString) throw new Error("QR String tidak ditemukan dari response DompetX");
+        if (!payment.qrString) throw new Error("QR String tidak ditemukan dari response QRIN");
 
         const newOrder = new Order({
             orderId: payment.displayOrderId,
@@ -1821,7 +1835,7 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
             expiresAt: junkOrderExpiry(),
             ...orderDetails,
             customerInfo,
-            paymentGateway: "dompetx",
+            paymentGateway: "qrin",
         });
         await newOrder.save({ session });
         await session.commitTransaction();
@@ -1836,29 +1850,31 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         });
         const qrBuffer = Buffer.from(qrDataURL.split(",")[1], "base64");
 
-        const caption = `📁 *Invoice Berhasil Dibuat*\n\`\`\`\n${payment.displayOrderId}\n\`\`\`\n────────────✧\n*QRIS SEMUA PEMBAYARAN*\n────────────✧\n*Informasi Item:*\n— Nama: ${product.name.toUpperCase()} - ${variant.name}\n— Jumlah: ${quantity}x\n\n*Informasi Pembayaran:*\n— ID Transaksi: \`${payment.displayOrderId}\`\n— Total Dibayar: Rp ${payment.totalBayar.toLocaleString('id-ID')}\n— Kedaluwarsa dalam: 3 Menit`;
-        const keyboard = Markup.inlineKeyboard([[Markup.button.callback('Batalkan Pembelian', `cancel_payment_dompetx_${payment.displayOrderId}`)]]);
+        const caption = `📁 *Invoice Berhasil Dibuat*\n\`\`\`\n${payment.displayOrderId}\n\`\`\`\n────────────✧\n*QRIS SEMUA PEMBAYARAN*\n────────────✧\n*Informasi Item:*\n— Nama: ${product.name.toUpperCase()} - ${variant.name}\n— Jumlah: ${quantity}x\n\n*Informasi Pembayaran:*\n— ID Transaksi: \`${payment.displayOrderId}\`\n— Total Dibayar: Rp ${payment.totalBayar.toLocaleString('id-ID')}\n— Kedaluwarsa dalam: 5 Menit`;
+        const keyboard = Markup.inlineKeyboard([[Markup.button.callback('Batalkan Pembelian', `cancel_payment_qrin_${payment.displayOrderId}`)]]);
 
         await ctx.deleteMessage().catch(() => {});
         qrPhotoMsg = await ctx.replyWithPhoto({ source: qrBuffer }, { caption, parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
 
-        const pollInterval = 10000;
-        const pollDuration = 180000;
+        // ===== MODE WEBHOOK (QRIN tidak menyediakan endpoint polling) =====
+        // Konfirmasi pembayaran datang dari QRIN via POST /callback -> fulfillQrinPaidOrder().
+        const pollDuration = 300000; // 5 menit, selaras dengan validity QRIN
         let isHandled = false;
-
-        const stopPolling = () => {
-            const sessionData = paymentSessions.get(payment.displayOrderId);
-            if (sessionData) {
-                clearInterval(sessionData.pollingId);
-                clearTimeout(sessionData.timeoutId);
-                paymentSessions.delete(payment.displayOrderId);
-            }
-        };
 
         const handleExpiry = async () => {
             if (isHandled) return;
             isHandled = true;
-            stopPolling();
+            const sessionData = paymentSessions.get(payment.displayOrderId);
+            if (sessionData) {
+                clearTimeout(sessionData.timeoutId);
+                paymentSessions.delete(payment.displayOrderId);
+            }
+
+            const expired = await Order.findOneAndUpdate(
+                { orderId: payment.displayOrderId, status: 'PENDING' },
+                { $set: { status: 'EXPIRED' } }
+            );
+            if (!expired) return; // sudah dibayar / diproses callback
 
             await Product.updateOne(
                 { id: productId, "variants.slug": variantSlug },
@@ -1867,84 +1883,21 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
                     $pull: { "variants.$.reserved_stock": { $in: reservedItems } }
                 }
             );
-            await Order.updateOne({ orderId: payment.displayOrderId, status: 'PENDING' }, { $set: { status: 'EXPIRED' } });
 
             await bot.telegram.deleteMessage(ctx.chat.id, qrPhotoMsg.message_id).catch(() => {});
-            await bot.telegram.sendMessage(ctx.from.id, `📜 *Tagihan Kadaluarsa*\n\nTagihan untuk ID \`${payment.displayOrderId}\` telah kadaluarsa.`, { parse_mode: 'Markdown' });
+            await bot.telegram.sendMessage(ctx.from.id, `📜 *Tagihan Kadaluarsa*\n\nTagihan untuk ID \`${payment.displayOrderId}\` telah kadaluarsa.`, { parse_mode: 'Markdown' }).catch(() => {});
         };
 
-        const pollingId = setInterval(async () => {
-            if (isHandled) return;
-            try {
-                const statusResult = await tokopay.checkPaymentStatus(payment.realOrderId);
-                console.log("[DOMPETX POLL] Status result:", JSON.stringify(statusResult, null, 2));
-
-                const statusRaw = String(statusResult?.status || statusResult?.data?.status || "").toUpperCase();
-
-                if (statusRaw === "PAID" || statusRaw === "SUCCESS" || statusRaw === "COMPLETED") {
-                    isHandled = true;
-                    stopPolling();
-
-                    const order = await Order.findOne({ orderId: payment.displayOrderId });
-                    if (!order) return;
-
-                    order.status = "PAID";
-                    order.paidAt = new Date();
-                    // Order lunas tidak boleh ikut terhapus TTL.
-                    order.expiresAt = undefined;
-                    await order.save();
-
-                    await Product.updateOne(
-                        { id: order.productId, "variants.slug": order.variantSlug },
-                        { $pull: { "variants.$.reserved_stock": { $in: order.reservedItems } } }
-                    );
-                    await User.updateOne({ id: order.customerInfo.telegramUserId }, { $inc: { totalSpent: order.amount } });
-
-                    const product = await Product.findOne({ id: order.productId });
-                    const variant = product ? product.variants.find(v => v.slug === order.variantSlug) : null;
-                    const snk = variant?.snk || null;
-
-                    if (order.quantity < 10) {
-                        const formattedItems = order.reservedItems.map((item, index) => `${index + 1}. ${item}`).join('\n');
-                        let successMessage = `🧾 *Pembelian Berhasil*\n\nTerima kasih!, Jika Ada Pertanyaan Silahkan Chat Admin Di wa.me/6285753323094\n\n` +
-                            `*Informasi Pembelian:*\n– Total Dibayar: Rp ${order.amount.toLocaleString('id-ID')}\n` +
-                            `– Metode: QRIS\n– ID Transaksi: \`${payment.displayOrderId}\`\n\n` +
-                            "```\n" + `${order.productName.toUpperCase()}\n${formattedItems}` + "\n```";
-                        if (snk && snk.trim() !== "" && snk.trim() !== "-") successMessage += `\n\n*Syarat & Ketentuan (SNK):*\n${snk}`;
-                        await bot.telegram.sendMessage(order.customerInfo.telegramUserId, successMessage, { parse_mode: 'Markdown' });
-
-                    } else {
-                        let successMessage = `🧾 *Pembelian Berhasil*\n\nTerima kasih!, Jika Ada Pertanyaan Silahkan Chat Admin Di wa.me/6285753323094\n\n` +
-                            `*Informasi Pembelian:*\n– Total Dibayar: Rp ${order.amount.toLocaleString('id-ID')}\n` +
-                            `– Metode: QRIS\n– ID Transaksi: \`${payment.displayOrderId}\`\n\n` +
-                            `Anda membeli *${order.quantity}* item. Akun Anda dikirimkan dalam file terpisah.`;
-                        if (snk && snk.trim() !== "" && snk.trim() !== "-") successMessage += `\n\n*Syarat & Ketentuan (SNK):*\n${snk}`;
-                        await bot.telegram.sendMessage(order.customerInfo.telegramUserId, successMessage, { parse_mode: 'Markdown' });
-
-                        const fileContent = order.reservedItems.join('\n');
-                        const fileName = `akun_${order.orderId}.txt`;
-                        await bot.telegram.sendDocument(
-                            order.customerInfo.telegramUserId,
-                            { source: Buffer.from(fileContent, 'utf-8'), filename: fileName },
-                            { caption: `Akun untuk order ${order.orderId}` }
-                        );
-                    }
-
-                    if (GROUP_NOTIF_ID) await sendAdminNotification(bot, order);
-                }
-
-            } catch (pollError) {
-                console.error("[DOMPETX] Error saat polling:", pollError);
-                isHandled = true;
-                stopPolling();
-            }
-        }, pollInterval);
-
         const timeoutId = setTimeout(handleExpiry, pollDuration);
-        paymentSessions.set(payment.displayOrderId, { pollingId, timeoutId, qrPhotoMsgId: qrPhotoMsg.message_id });
+        paymentSessions.set(payment.displayOrderId, {
+            timeoutId,
+            qrPhotoMsgId: qrPhotoMsg.message_id,
+            chatId: ctx.chat.id,
+            userId: ctx.from.id,
+        });
 
     } catch (error) {
-        console.error('[DOMPETX] Error in action:', error);
+        console.error('[QRIN] Error in action:', error);
 
         if (!transactionCommitted) {
             await session.abortTransaction();
@@ -1957,6 +1910,143 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
 
     } finally {
         session.endSession();
+    }
+});
+
+// ===== Pemenuhan order yang sudah dibayar (dipanggil oleh webhook QRIN) =====
+async function fulfillQrinPaidOrder(orderId) {
+    const order = await Order.findOneAndUpdate(
+        { orderId: orderId, status: 'PENDING' },
+        { $set: { status: 'PAID', paidAt: new Date() }, $unset: { expiresAt: "" } },
+        { new: true }
+    );
+    if (!order) {
+        const existing = await Order.findOne({ orderId: orderId }).lean();
+        if (existing && existing.status === 'PAID') return { ok: false, reason: 'already_paid' };
+        return { ok: false, reason: 'not_pending' };
+    }
+
+    const sess = paymentSessions.get(orderId);
+    if (sess) {
+        clearTimeout(sess.timeoutId);
+        paymentSessions.delete(orderId);
+        if (sess.chatId && sess.qrPhotoMsgId) {
+            await bot.telegram.deleteMessage(sess.chatId, sess.qrPhotoMsgId).catch(() => {});
+        }
+    }
+
+    await Product.updateOne(
+        { id: order.productId, "variants.slug": order.variantSlug },
+        { $pull: { "variants.$.reserved_stock": { $in: order.reservedItems } } }
+    );
+    await User.updateOne({ id: order.customerInfo.telegramUserId }, { $inc: { totalSpent: order.amount } });
+
+    const product = await Product.findOne({ id: order.productId });
+    const variant = product ? product.variants.find(v => v.slug === order.variantSlug) : null;
+    const snk = variant?.snk || null;
+
+    if (order.quantity < 10) {
+        const formattedItems = order.reservedItems.map((item, index) => `${index + 1}. ${item}`).join('\n');
+        let successMessage = `🧾 *Pembelian Berhasil*\n\nTerima kasih!, Jika Ada Pertanyaan Silahkan Chat Admin Di wa.me/6285753323094\n\n` +
+            `*Informasi Pembelian:*\n– Total Dibayar: Rp ${order.amount.toLocaleString('id-ID')}\n` +
+            `– Metode: QRIS\n– ID Transaksi: \`${order.orderId}\`\n\n` +
+            "```\n" + `${order.productName.toUpperCase()}\n${formattedItems}` + "\n```";
+        if (snk && snk.trim() !== "" && snk.trim() !== "-") successMessage += `\n\n*Syarat & Ketentuan (SNK):*\n${snk}`;
+        await bot.telegram.sendMessage(order.customerInfo.telegramUserId, successMessage, { parse_mode: 'Markdown' }).catch(() => {});
+    } else {
+        let successMessage = `🧾 *Pembelian Berhasil*\n\nTerima kasih!, Jika Ada Pertanyaan Silahkan Chat Admin Di wa.me/6285753323094\n\n` +
+            `*Informasi Pembelian:*\n– Total Dibayar: Rp ${order.amount.toLocaleString('id-ID')}\n` +
+            `– Metode: QRIS\n– ID Transaksi: \`${order.orderId}\`\n\n` +
+            `Anda membeli *${order.quantity}* item. Akun Anda dikirimkan dalam file terpisah.`;
+        if (snk && snk.trim() !== "" && snk.trim() !== "-") successMessage += `\n\n*Syarat & Ketentuan (SNK):*\n${snk}`;
+        await bot.telegram.sendMessage(order.customerInfo.telegramUserId, successMessage, { parse_mode: 'Markdown' }).catch(() => {});
+
+        const fileContent = order.reservedItems.join('\n');
+        const fileName = `akun_${order.orderId}.txt`;
+        await bot.telegram.sendDocument(
+            order.customerInfo.telegramUserId,
+            { source: Buffer.from(fileContent, 'utf-8'), filename: fileName },
+            { caption: `Akun untuk order ${order.orderId}` }
+        ).catch(() => {});
+    }
+
+    if (GROUP_NOTIF_ID) await sendAdminNotification(bot, order).catch(() => {});
+    return { ok: true };
+}
+
+// ===== Webhook / Callback QRIN =====
+// Daftarkan URL callback di QRIN ke: https://alimcloud.id/callback
+// Tanda tangan: header X-Callback-Signature = HMAC-SHA256(raw body, QRIN_TOKEN).
+app.get(['/health', '/ping'], (req, res) => res.status(200).json({ status: 'ok', paymentGateway: 'qrin', qrinConfigured: Boolean(process.env.QRIN_TOKEN) }));
+
+app.post(['/callback', '/qrin/callback'], async (req, res) => {
+    try {
+        const signature = req.headers['x-callback-signature'];
+        const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body || {}), 'utf8');
+        if (!qrin.verifyCallbackSignature(rawBody, signature)) {
+            console.warn('[QRIN CALLBACK] Signature tidak valid');
+            return res.status(401).json({ success: false, message: 'Invalid signature' });
+        }
+        const data = req.body || {};
+        const orderId = data.no_ref_merchant;
+        const status = String(data.status || '').toLowerCase();
+        console.log(`[QRIN CALLBACK] order=${orderId} status=${status}`);
+        if (!orderId) return res.status(400).json({ success: false, message: 'no_ref_merchant missing' });
+
+        if (status === 'success') {
+            const result = await fulfillQrinPaidOrder(orderId);
+            if (!result.ok && result.reason === 'not_pending') {
+                const ownerId = process.env.OWNER_ID;
+                if (ownerId) {
+                    await bot.telegram.sendMessage(ownerId, `⚠️ [QRIN] Pembayaran diterima untuk order \`${orderId}\` tetapi status order bukan PENDING. Perlu cek manual.`, { parse_mode: 'Markdown' }).catch(() => {});
+                }
+            }
+        }
+        return res.json({ success: true });
+    } catch (e) {
+        console.error('[QRIN CALLBACK] Error:', e.message);
+        return res.status(500).json({ success: false });
+    }
+});
+
+// Handler pembatalan pembayaran QRIN (QRIS ALL). Didaftarkan sebelum handler generic.
+bot.action(/^cancel_payment_qrin_(.*)$/, async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        const orderId = ctx.match[1];
+        const paymentSession = paymentSessions.get(orderId);
+        if (paymentSession) {
+            clearTimeout(paymentSession.timeoutId);
+            paymentSessions.delete(orderId);
+            await ctx.deleteMessage(paymentSession.qrPhotoMsgId).catch(() => {});
+        } else {
+            await ctx.deleteMessage().catch(() => {});
+        }
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        try {
+            const order = await Order.findOneAndUpdate({ orderId: orderId, status: 'PENDING' }, { $set: { status: 'CANCELLED', cancelledAt: new Date() } }, { new: true, session: session });
+            if (!order) {
+                await ctx.reply('Pesanan tidak ditemukan atau sudah diproses.');
+                await session.abortTransaction();
+                session.endSession();
+                return;
+            }
+            if (order.reservedItems && order.reservedItems.length > 0) {
+                await Product.updateOne({ id: order.productId, "variants.slug": order.variantSlug }, { $push: { "variants.$.stock": { $each: order.reservedItems } }, $pull: { "variants.$.reserved_stock": { $in: order.reservedItems } } }).session(session);
+            }
+            await session.commitTransaction();
+            await ctx.reply('❌ Pesanan QRIS Anda telah berhasil dibatalkan.');
+        } catch (dbError) {
+            await session.abortTransaction();
+            console.error('Database error during QRIN cancellation:', dbError);
+            await ctx.reply('❌ Terjadi kesalahan internal saat membatalkan pesanan.');
+        } finally {
+            session.endSession();
+        }
+    } catch (error) {
+        console.error('Error in cancel_payment_qrin:', error);
+        await ctx.reply('❌ Terjadi kesalahan saat memproses pembatalan.');
     }
 });
 
@@ -2250,7 +2340,12 @@ bot.hears(/^[^\/]/, async (ctx) => {
             const stockToAdd = ctx.message.text.split('\n').filter(line => line.trim() !== '');
             await adminModule.addStock(userState.productId, userState.variantSlug, stockToAdd, ctx);
             delete userStates[userId];
-            
+
+        } else if (userState.state === 'awaiting_take_stock_count') {
+            const jumlah = parseInt(String(ctx.message.text).replace(/\D/g, ''), 10);
+            await adminModule.takeStock(userState.productId, userState.variantSlug, jumlah, ctx);
+            delete userStates[userId];
+
         } else if (userState.state === 'edit_product_name_desc') {
             const parts = ctx.message.text.split('|').map(p => p.trim());
             if (parts.length !== 2) {
