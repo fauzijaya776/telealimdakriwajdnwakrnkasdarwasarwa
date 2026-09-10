@@ -25,6 +25,7 @@ const qrin = require('./qris_qrin');
 const linkqu = require('./qris_linkqu');
 const adminModule = require('./admin');
 const QRCode = require('qrcode');
+const docheck = require('./docheck');
 // === 2. INISIALISASI & KONEKSI DATABASE ===
 connectDB(); 
 
@@ -37,6 +38,58 @@ const GROUP_NOTIF_ID = process.env.GROUP_NOTIF_ID;
 // Ambil userStates dari modul admin dan inisialisasi sesi pembayaran
 const { userStates } = adminModule;
 const paymentSessions = new Map();
+
+// -----------------------------------------------------------------
+// FORMAT TAMPILAN AKUN UNTUK CUSTOMER
+// DigitalOcean (dop_v1|email|password|2fa) -> berlabel; produk biasa
+// dgn pembatas '|' -> tiap bagian ke baris sendiri; tanpa pembatas -> apa adanya.
+// -----------------------------------------------------------------
+function formatAccountItem(item) {
+    if (!item || typeof item !== 'string') return item;
+    const allLines = item.split(/\r?\n/);
+    const firstLine = allLines[0];
+    const extra = allLines.slice(1).filter((l) => l.trim());
+
+    if (firstLine.includes('dop_v1')) {
+        const parts = firstLine.split('|').map((p) => p.trim());
+        const labels = ['api key', 'email', 'password', '2fa'];
+        const out = [];
+        for (let i = 0; i < parts.length; i++) {
+            if (!parts[i]) continue;
+            const label = labels[i] || `field${i + 1}`;
+            out.push(`${label} = ${parts[i]}`);
+        }
+        if (extra.length) out.push(...extra);
+        return out.join('\n');
+    }
+
+    if (firstLine.includes('|')) {
+        const parts = firstLine.split('|').map((p) => p.trim()).filter(Boolean);
+        const out = [...parts];
+        if (extra.length) out.push(...extra);
+        return out.join('\n');
+    }
+
+    return item;
+}
+
+function formatItemsForCustomer(items) {
+    if (!Array.isArray(items)) return '';
+    if (items.length === 1) return formatAccountItem(items[0]);
+    const anyMulti = items.some((it) => formatAccountItem(it).includes('\n'));
+    const sep = anyMulti ? '\n\n' : '\n';
+    return items
+        .map((item, i) => {
+            const f = formatAccountItem(item);
+            return f.includes('\n') ? `${i + 1}.\n${f}` : `${i + 1}. ${f}`;
+        })
+        .join(sep);
+}
+
+function formatItemsForFile(items) {
+    if (!Array.isArray(items)) return '';
+    return items.map(formatAccountItem).join('\n\n');
+}
 
 // =============================================================
 // KEBIJAKAN RETENSI DATA (MongoDB Atlas M0 hanya 512MB)
@@ -153,6 +206,111 @@ async function sendAdminNotification(bot, order) {
 
     } catch (error) {
         console.error(`Gagal mengirim notifikasi admin untuk order ${order.orderId}:`, error);
+    }
+}
+
+// =================================================================
+// PENGIRIMAN AKUN KE CUSTOMER — TAHAN BANTING
+// Menangani "sudah bayar tapi akun tidak terkirim": coba Markdown ->
+// fallback teks biasa -> kalau tetap gagal, LAPOR owner + file akun untuk
+// dikirim manual, dan order tidak ditandai delivered. Tidak pernah melempar.
+// =================================================================
+function ownerIdList() {
+    return (process.env.OWNER_ID || '').split(',').map((id) => id.trim()).filter(Boolean);
+}
+
+async function markOrderDelivered(orderId) {
+    try {
+        await Order.updateOne({ orderId }, { $set: { delivered: true, deliveredAt: new Date() } });
+    } catch (e) {
+        console.error(`[DELIVERY] Gagal set delivered utk ${orderId}:`, e.message);
+    }
+}
+
+async function alertOwnerDeliveryFailed(order, reason) {
+    const owners = ownerIdList();
+    if (owners.length === 0) return;
+    const head = [
+        '🚨 *GAGAL KIRIM AKUN KE CUSTOMER*',
+        '',
+        `Order \`${order.orderId}\` sudah *DIBAYAR* tetapi akun *GAGAL terkirim*.`,
+        `User: \`${order.customerInfo?.telegramUserId || '-'}\``,
+        `Produk: ${order.productName} - ${order.variantName}`,
+        `Jumlah: ${order.quantity}x`,
+        `Sebab: ${reason}`,
+        '',
+        `Kirim manual akun di file berikut, lalu jalankan \`/resend ${order.orderId}\`.`,
+    ].join('\n');
+    const fileContent = formatItemsForFile(order.reservedItems || []);
+    for (const o of owners) {
+        await bot.telegram.sendMessage(o, head, { parse_mode: 'Markdown' }).catch(() => {});
+        await bot.telegram.sendDocument(
+            o,
+            { source: Buffer.from(fileContent || '(kosong)', 'utf-8'), filename: `BELUM_TERKIRIM_${order.orderId}.txt` },
+            { caption: `Akun order ${order.orderId} (belum terkirim ke customer)` }
+        ).catch(() => {});
+    }
+}
+
+async function sendMessageWithFallback(chatId, markdownMsg) {
+    try {
+        await bot.telegram.sendMessage(chatId, markdownMsg, { parse_mode: 'Markdown' });
+    } catch (e) {
+        console.warn(`[DELIVERY] Markdown gagal (${e.message}), coba teks biasa...`);
+        const plain = markdownMsg.replace(/```/g, '').replace(/[*_`]/g, '');
+        await bot.telegram.sendMessage(chatId, plain);
+    }
+}
+
+async function deliverAccountsToCustomer(order, methodLabel) {
+    const chatId = order.customerInfo?.telegramUserId;
+    if (!chatId) {
+        await alertOwnerDeliveryFailed(order, 'telegramUserId customer kosong');
+        return false;
+    }
+
+    let snk = null;
+    try {
+        const product = await Product.findOne({ id: order.productId });
+        const variant = product ? product.variants.find((v) => v.slug === order.variantSlug) : null;
+        snk = variant && variant.snk ? variant.snk : null;
+    } catch (e) { /* SNK opsional */ }
+    const hasSnk = snk && snk.trim() !== '' && snk.trim() !== '-';
+
+    // Branding ALIM STORE dipertahankan.
+    const infoLine =
+        `*Info Pembelian:*\n– Total: Rp ${Number(order.amount).toLocaleString('id-ID')}\n` +
+        `– Metode: ${methodLabel}\n– ID Transaksi: \`${order.orderId}\``;
+    const header = `🧾 *Pembelian Berhasil*\n\nTerima kasih!, Jika Ada Pertanyaan Silahkan Chat Admin Di wa.me/6285753323094\n\n`;
+
+    try {
+        if (order.quantity < 10) {
+            const formattedItems = formatItemsForCustomer(order.reservedItems);
+            let msg = header + `${infoLine}\n\n` +
+                "```\n" + `${order.productName.toUpperCase()}\n${formattedItems}` + "\n```";
+            if (hasSnk) msg += `\n\n*Syarat & Ketentuan (SNK):*\n${snk}`;
+            await sendMessageWithFallback(chatId, msg);
+        } else {
+            let msg = header + `${infoLine}\n\n` +
+                `Anda membeli *${order.quantity}* item. Akun Anda dikirim dalam file terpisah.`;
+            if (hasSnk) msg += `\n\n*Syarat & Ketentuan (SNK):*\n${snk}`;
+            await sendMessageWithFallback(chatId, msg);
+
+            const fileContent = formatItemsForFile(order.reservedItems);
+            await bot.telegram.sendDocument(
+                chatId,
+                { source: Buffer.from(fileContent, 'utf-8'), filename: `akun_${order.orderId}.txt` },
+                { caption: `Akun untuk order ${order.orderId}` }
+            );
+        }
+
+        await markOrderDelivered(order.orderId);
+        if (GROUP_NOTIF_ID) await sendAdminNotification(bot, order).catch(() => {});
+        return true;
+    } catch (err) {
+        console.error(`[DELIVERY] GAGAL kirim akun order ${order.orderId}:`, err.message);
+        await alertOwnerDeliveryFailed(order, err.message || String(err));
+        return false;
     }
 }
 
@@ -1508,68 +1666,32 @@ bot.action(/^dana_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
 
         const pollingId = setInterval(async () => {
             if (isHandled) return;
-            const statusResult = await dana.checkDanaPaymentStatus(internalOrderId);
-            
-            if (statusResult?.status?.toLowerCase() === "success") {
-                isHandled = true;
-                stopPolling();
-                
-                const order = await Order.findOneAndUpdate(
-                    { orderId: internalOrderId, status: 'PENDING' },
-                    {
-                        // HEMAT STORAGE: ringkasan saja, bukan payload mentah gateway.
-                        $set: { status: 'PAID', paidAt: new Date(), paymentDetails: slimPaymentDetails(statusResult) },
-                        // Order lunas tidak boleh ikut terhapus TTL.
-                        $unset: { expiresAt: '' }
-                    },
-                    { new: true }
-                );
+            try {
+                const statusResult = await dana.checkDanaPaymentStatus(internalOrderId);
 
-                if (order) {
-                    await Product.updateOne({ id: order.productId, "variants.slug": order.variantSlug }, { $pull: { "variants.$.reserved_stock": { $in: order.reservedItems } } });
-                    await User.updateOne({ id: order.customerInfo.telegramUserId }, { $inc: { totalSpent: order.amount } });
+                if (statusResult?.status?.toLowerCase() === "success") {
+                    isHandled = true;
+                    stopPolling();
 
-                    const product = await Product.findOne({ id: order.productId });
-                    const variant = product ? product.variants.find(v => v.slug === order.variantSlug) : null;
-                    const snk = variant && variant.snk ? variant.snk : null;
+                    const order = await Order.findOneAndUpdate(
+                        { orderId: internalOrderId, status: 'PENDING' },
+                        {
+                            $set: { status: 'PAID', paidAt: new Date(), paymentDetails: slimPaymentDetails(statusResult) },
+                            $unset: { expiresAt: '' }
+                        },
+                        { new: true }
+                    );
 
-                    const formattedItems = order.reservedItems.map((item, index) => `${index + 1}. ${item}`).join('\n');
-                    
-                    // --- LOGIKA KONDISIONAL BARU ---
-                    if (order.quantity < 10) {
-                        // Jika pembelian < 10, kirim seperti biasa
-                        const formattedItems = order.reservedItems.map((item, index) => `${index + 1}. ${item}`).join('\n');
-                        let successMessage = `🧾 *Pembelian Berhasil*\n\nTerima kasih!\n\n` + `*Info Pembelian:*\n– Total: Rp ${order.amount.toLocaleString('id-ID')}\n– Metode: DANA\n\n` + "```\n" + `${order.productName.toUpperCase()}\n${formattedItems}` + "\n```";
-                        
-                        if (snk && snk.trim() !== "" && snk.trim() !== "-") {
-                            successMessage += `\n\n*Syarat & Ketentuan (SNK):*\n${snk}`;
-                        }
-                        await bot.telegram.sendMessage(ctx.from.id, successMessage, { parse_mode: 'Markdown' });
+                    if (order) {
+                        await Product.updateOne({ id: order.productId, "variants.slug": order.variantSlug }, { $pull: { "variants.$.reserved_stock": { $in: order.reservedItems } } });
+                        await User.updateOne({ id: order.customerInfo.telegramUserId }, { $inc: { totalSpent: order.amount } });
 
-                    } else {
-                        // Jika pembelian >= 10, kirim via file .txt
-                        let successMessage = `🧾 *Pembelian Berhasil*\n\nTerima kasih!\n\n` + `*Info Pembelian:*\n– Total: Rp ${order.amount.toLocaleString('id-ID')}\n– Metode: DANA\n\n` + `Anda membeli *${order.quantity}* item. Akun Anda dikirimkan dalam file terpisah.`;
-
-                        if (snk && snk.trim() !== "" && snk.trim() !== "-") {
-                            successMessage += `\n\n*Syarat & Ketentuan (SNK):*\n${snk}`;
-                        }
-                        await bot.telegram.sendMessage(ctx.from.id, successMessage, { parse_mode: 'Markdown' });
-
-                        // Kirim file .txt
-                        const fileContent = order.reservedItems.join('\n');
-                        const fileName = `akun_${order.orderId}.txt`;
-                        await bot.telegram.sendDocument(
-                            ctx.from.id,
-                            { source: Buffer.from(fileContent, 'utf-8'), filename: fileName },
-                            { caption: `Akun untuk order ${order.orderId}` }
-                        );
-                    }
-
-                    // Notifikasi ke grup admin tidak berubah
-                    if (GROUP_NOTIF_ID) {
-                        await sendAdminNotification(bot, order);
+                        // Kirim akun via helper tahan-banting (fallback + lapor owner bila gagal).
+                        await deliverAccountsToCustomer(order, 'DANA');
                     }
                 }
+            } catch (pollError) {
+                console.error('[DANA] poll error:', pollError.message);
             }
         }, pollInterval);
 
@@ -1703,43 +1825,8 @@ bot.action(/^qris_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
                     await Product.updateOne({ id: order.productId, "variants.slug": order.variantSlug }, { $pull: { "variants.$.reserved_stock": { $in: order.reservedItems } } });
                     await User.updateOne({ id: order.customerInfo.telegramUserId }, { $inc: { totalSpent: order.amount } });
                     
-                    // [TAMBAHAN] Ambil data SNK dari Produk
-                    const product = await Product.findOne({ id: order.productId });
-                    const variant = product ? product.variants.find(v => v.slug === order.variantSlug) : null;
-                    const snk = variant && variant.snk ? variant.snk : null;
-
-                    const formattedItems = order.reservedItems.map((item, index) => `${index + 1}. ${item}`).join('\n');
-                    
-                    // --- LOGIKA KONDISIONAL BARU ---
-                    if (order.quantity < 10) {
-                        const formattedItems = order.reservedItems.map((item, index) => `${index + 1}. ${item}`).join('\n');
-                        let successMessage = `🧾 *Pembelian Berhasil*\n\nTerima kasih!\n\n` + `*Info Pembelian:*\n– Total Dibayar: Rp ${order.amount.toLocaleString('id-ID')}\n` + `– Metode: QRIS\n– ID Transaksi: \`${payment.realOrderId}\`\n\n` + "```\n" + `${order.productName.toUpperCase()}\n${formattedItems}` + "\n```";
-
-                        if (snk && snk.trim() !== "" && snk.trim() !== "-") {
-                            successMessage += `\n\n*Syarat & Ketentuan (SNK):*\n${snk}`;
-                        }
-                        await bot.telegram.sendMessage(order.customerInfo.telegramUserId, successMessage, { parse_mode: 'Markdown' });
-
-                    } else {
-                        let successMessage = `🧾 *Pembelian Berhasil*\n\nTerima kasih!\n\n` + `*Info Pembelian:*\n– Total Dibayar: Rp ${order.amount.toLocaleString('id-ID')}\n` + `– Metode: QRIS\n– ID Transaksi: \`${payment.realOrderId}\`\n\n` + `Anda membeli *${order.quantity}* item. Akun Anda dikirimkan dalam file terpisah.`;
-
-                        if (snk && snk.trim() !== "" && snk.trim() !== "-") {
-                            successMessage += `\n\n*Syarat & Ketentuan (SNK):*\n${snk}`;
-                        }
-                        await bot.telegram.sendMessage(order.customerInfo.telegramUserId, successMessage, { parse_mode: 'Markdown' });
-
-                        const fileContent = order.reservedItems.join('\n');
-                        const fileName = `akun_${order.orderId}.txt`;
-                        await bot.telegram.sendDocument(
-                            order.customerInfo.telegramUserId,
-                            { source: Buffer.from(fileContent, 'utf-8'), filename: fileName },
-                            { caption: `Akun untuk order ${order.orderId}` }
-                        );
-                    }
-
-                    if (GROUP_NOTIF_ID) {
-                        await sendAdminNotification(bot, order);
-                    }
+                    // Kirim akun via helper tahan-banting (fallback + lapor owner bila gagal).
+                    await deliverAccountsToCustomer(order, 'QRIS');
 
                 } else if (statusResult.status === "EXPIRED" || statusResult.status === "FAILED") {
                     await handleExpiry();
@@ -1941,36 +2028,8 @@ async function fulfillQrinPaidOrder(orderId) {
     );
     await User.updateOne({ id: order.customerInfo.telegramUserId }, { $inc: { totalSpent: order.amount } });
 
-    const product = await Product.findOne({ id: order.productId });
-    const variant = product ? product.variants.find(v => v.slug === order.variantSlug) : null;
-    const snk = variant?.snk || null;
-
-    if (order.quantity < 10) {
-        const formattedItems = order.reservedItems.map((item, index) => `${index + 1}. ${item}`).join('\n');
-        let successMessage = `🧾 *Pembelian Berhasil*\n\nTerima kasih!, Jika Ada Pertanyaan Silahkan Chat Admin Di wa.me/6285753323094\n\n` +
-            `*Informasi Pembelian:*\n– Total Dibayar: Rp ${order.amount.toLocaleString('id-ID')}\n` +
-            `– Metode: QRIS\n– ID Transaksi: \`${order.orderId}\`\n\n` +
-            "```\n" + `${order.productName.toUpperCase()}\n${formattedItems}` + "\n```";
-        if (snk && snk.trim() !== "" && snk.trim() !== "-") successMessage += `\n\n*Syarat & Ketentuan (SNK):*\n${snk}`;
-        await bot.telegram.sendMessage(order.customerInfo.telegramUserId, successMessage, { parse_mode: 'Markdown' }).catch(() => {});
-    } else {
-        let successMessage = `🧾 *Pembelian Berhasil*\n\nTerima kasih!, Jika Ada Pertanyaan Silahkan Chat Admin Di wa.me/6285753323094\n\n` +
-            `*Informasi Pembelian:*\n– Total Dibayar: Rp ${order.amount.toLocaleString('id-ID')}\n` +
-            `– Metode: QRIS\n– ID Transaksi: \`${order.orderId}\`\n\n` +
-            `Anda membeli *${order.quantity}* item. Akun Anda dikirimkan dalam file terpisah.`;
-        if (snk && snk.trim() !== "" && snk.trim() !== "-") successMessage += `\n\n*Syarat & Ketentuan (SNK):*\n${snk}`;
-        await bot.telegram.sendMessage(order.customerInfo.telegramUserId, successMessage, { parse_mode: 'Markdown' }).catch(() => {});
-
-        const fileContent = order.reservedItems.join('\n');
-        const fileName = `akun_${order.orderId}.txt`;
-        await bot.telegram.sendDocument(
-            order.customerInfo.telegramUserId,
-            { source: Buffer.from(fileContent, 'utf-8'), filename: fileName },
-            { caption: `Akun untuk order ${order.orderId}` }
-        ).catch(() => {});
-    }
-
-    if (GROUP_NOTIF_ID) await sendAdminNotification(bot, order).catch(() => {});
+    // Kirim akun via helper tahan-banting (fallback teks biasa + lapor owner bila gagal).
+    await deliverAccountsToCustomer(order, 'QRIS');
     return { ok: true };
 }
 
@@ -2825,6 +2884,73 @@ bot.command('refund', async (ctx) => {
     await ctx.reply(message, { parse_mode: 'Markdown' });
 });
 
+// ===== Perintah OWNER: cek akun DigitalOcean, preview, & pemulihan kirim =====
+bot.command('cekdo', async (ctx) => {
+    const ADMIN_IDS = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
+    if (!ADMIN_IDS.includes(String(ctx.from.id))) return;
+    await ctx.reply('🔍 Memulai pengecekan akun DigitalOcean di stok...');
+    try {
+        const result = await docheck.runDigitalOceanCheck(bot);
+        if (result && result.skipped) await ctx.reply('⏳ Pengecekan lain sedang berjalan.');
+        else if (result && typeof result.checked === 'number') await ctx.reply(`✅ Selesai.\nDicek: ${result.checked}\nLocked (dihapus): ${result.removed}\nInvalid: ${result.invalid}`);
+        else await ctx.reply('✅ Pengecekan selesai.');
+    } catch (err) { await ctx.reply(`❌ Gagal: ${err.message}`); }
+});
+
+bot.command('preview', async (ctx) => {
+    const ADMIN_IDS = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
+    if (!ADMIN_IDS.includes(String(ctx.from.id))) return;
+    const raw = ctx.message.text.replace(/^\/preview(@\w+)?\s*/i, '').trim();
+    if (raw) {
+        const formatted = formatItemsForCustomer([raw]);
+        return ctx.reply(`👁️ *Preview Tampilan ke Customer*\n\n` + "```\n" + `PRODUK\n${formatted}` + "\n```", { parse_mode: 'Markdown' });
+    }
+    try {
+        const products = await Product.find().lean();
+        for (const product of products) {
+            for (const variant of product.variants || []) {
+                const stock = variant.stock || [];
+                if (stock.length > 0) {
+                    const formatted = formatItemsForCustomer([stock[0]]);
+                    return ctx.reply(`👁️ *Preview Tampilan ke Customer*\n(${product.name} - ${variant.name})\n\n` + "```\n" + `${product.name.toUpperCase()}\n${formatted}` + "\n```", { parse_mode: 'Markdown' });
+                }
+            }
+        }
+        return ctx.reply('Tidak ada stok. Coba: `/preview id|password|note|note`', { parse_mode: 'Markdown' });
+    } catch (err) { return ctx.reply(`❌ Gagal: ${err.message}`); }
+});
+
+bot.command('belumkirim', async (ctx) => {
+    const ADMIN_IDS = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
+    if (!ADMIN_IDS.includes(String(ctx.from.id))) return;
+    try {
+        const orders = await Order.find({ status: 'PAID', delivered: { $ne: true } }).sort({ paidAt: -1 }).limit(30).lean();
+        if (orders.length === 0) return ctx.reply('✅ Tidak ada order yang belum terkirim.');
+        const lines = [`⚠️ *${orders.length} order sudah dibayar tapi akun belum terkirim:*`, ''];
+        orders.forEach((o, i) => {
+            const when = o.paidAt ? moment(o.paidAt).tz('Asia/Jakarta').format('DD/MM HH:mm') : '-';
+            lines.push(`${i + 1}. \`${o.orderId}\`\n   ${o.productName} - ${o.variantName} (${o.quantity}x) • user ${o.customerInfo?.telegramUserId} • ${when}`);
+        });
+        lines.push('', 'Kirim ulang: `/resend <ID_ORDER>`');
+        await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
+    } catch (err) { await ctx.reply(`❌ Gagal: ${err.message}`); }
+});
+
+bot.command('resend', async (ctx) => {
+    const ADMIN_IDS = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
+    if (!ADMIN_IDS.includes(String(ctx.from.id))) return;
+    const orderId = ctx.message.text.replace(/^\/resend(@\w+)?\s*/i, '').trim();
+    if (!orderId) return ctx.reply('Format: `/resend <ID_ORDER>`', { parse_mode: 'Markdown' });
+    try {
+        const order = await Order.findOne({ orderId }).lean();
+        if (!order) return ctx.reply('❌ Order tidak ditemukan.');
+        if (order.status !== 'PAID') return ctx.reply(`❌ Status order = ${order.status} (bukan PAID).`);
+        if (!order.reservedItems || order.reservedItems.length === 0) return ctx.reply('❌ Data akun order ini sudah kosong (lewat masa retensi).');
+        const ok = await deliverAccountsToCustomer(order, (order.paymentGateway || 'QRIS').toUpperCase());
+        await ctx.reply(ok ? `✅ Akun order \`${orderId}\` berhasil dikirim ulang.` : `❌ Masih gagal kirim untuk \`${orderId}\`. Cek apakah bot diblokir user.`, { parse_mode: 'Markdown' });
+    } catch (err) { await ctx.reply(`❌ Gagal: ${err.message}`); }
+});
+
 // =================================================================
 // BAGIAN C: TITIK MULAI APLIKASI (LAUNCHER)
 // =================================================================
@@ -2855,6 +2981,24 @@ bot.launch().then(() => {
 // dan pembuatan index selesai dulu), lalu berkala.
 setTimeout(runStorageMaintenance, 30 * 1000);
 setInterval(runStorageMaintenance, MAINTENANCE_INTERVAL_HOURS * 60 * 60 * 1000);
+
+// Pengecekan akun DigitalOcean di stok: 60 detik setelah start, lalu tiap 1 jam.
+// Akun locked otomatis dihapus dari stok & dilaporkan ke OWNER_ID.
+setTimeout(() => docheck.runDigitalOceanCheck(bot), 60 * 1000);
+setInterval(() => docheck.runDigitalOceanCheck(bot), docheck.CHECK_INTERVAL_MS);
+
+// Jaring pengaman: error tak tertangkap tidak mematikan seluruh bot, cukup dilaporkan.
+process.on('unhandledRejection', (reason) => {
+    console.error('[UNHANDLED REJECTION]', reason);
+    const owners = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
+    const msg = (reason && reason.message) ? reason.message : String(reason);
+    for (const o of owners) bot.telegram.sendMessage(o, `⚠️ [BOT] Unhandled rejection:\n${msg}`).catch(() => {});
+});
+process.on('uncaughtException', (err) => {
+    console.error('[UNCAUGHT EXCEPTION]', err);
+    const owners = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
+    for (const o of owners) bot.telegram.sendMessage(o, `⚠️ [BOT] Uncaught exception:\n${err.message}`).catch(() => {});
+});
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));

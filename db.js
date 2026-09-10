@@ -52,6 +52,10 @@ const OrderSchema = new mongoose.Schema({
     depositId: String,
     amount: Number,
     status: { type: String, enum: ['PENDING', 'PAID', 'CANCELLED', 'EXPIRED', 'FAILED'], default: 'PENDING' },
+    // Penanda apakah akun sudah BENAR-BENAR terkirim ke customer.
+    // status PAID = uang masuk; delivered = akun sampai ke pembeli.
+    delivered: { type: Boolean, default: false },
+    deliveredAt: Date,
     createdAt: { type: Date, default: Date.now },
     paidAt: Date,
     cancelledAt: Date,
