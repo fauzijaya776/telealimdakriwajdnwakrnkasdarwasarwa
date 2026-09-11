@@ -890,7 +890,23 @@ async function generateStartMessageAndKeyboard(ctx) {
     const keyboardLayout = [['🛒 List Produk', '🧾 Riwayat Transaksi'], ['📦 Cek Stok']];
     if (isAdmin) keyboardLayout.push(['⚙️ Admin Panel']);
 
-    return { message, keyboard: Markup.keyboard(keyboardLayout).resize() };
+    // Tombol INLINE di bawah teks /start (mirip tombol pada /stock), biar
+    // customer bisa langsung tekan tanpa mengetik. Memakai action yang ada:
+    // list_products_1, show_stock, show_history, open_admin.
+    const inlineRows = [
+        [
+            Markup.button.callback('🛒 Lihat Produk', 'list_products_1'),
+            Markup.button.callback('📦 Cek Stok', 'show_stock'),
+        ],
+        [Markup.button.callback('🧾 Riwayat Transaksi', 'show_history')],
+    ];
+    if (isAdmin) inlineRows.push([Markup.button.callback('⚙️ Admin Panel', 'open_admin')]);
+
+    return {
+        message,
+        keyboard: Markup.keyboard(keyboardLayout).resize(),
+        inlineKeyboard: Markup.inlineKeyboard(inlineRows),
+    };
 }
 
 async function generateProductListMessageAndKeyboard(page = 1) {
@@ -1334,39 +1350,96 @@ async function generatePaymentMessageAndKeyboard(productId, variantSlug, quantit
 
 bot.start(async (ctx) => {
     try {
-        const { message, keyboard } = await generateStartMessageAndKeyboard(ctx);
+        const { message, keyboard, inlineKeyboard } = await generateStartMessageAndKeyboard(ctx);
         const imagePath = path.join(__dirname, 'assets', 'welcome.png');
         // FIX BUG: kalau assets/welcome.png hilang, replyWithPhoto melempar
         // error dan customer hanya melihat "Terjadi kesalahan saat memulai bot".
         const fileExists = await fs.access(imagePath).then(() => true).catch(() => false);
 
+        // Set dulu keyboard bawah (reply keyboard) lewat pesan kecil, lalu kirim
+        // pesan utama berisi tombol INLINE (Lihat Produk / Cek Stok / Riwayat).
+        // Dengan begitu customer punya DUA-duanya: menu bawah + tombol inline.
+        await ctx.reply('🏠 Menu utama:', { reply_markup: keyboard.reply_markup }).catch(() => {});
+
         if (fileExists) {
-            // Keyboard menu utama dilampirkan langsung ke pesan foto
+            // Tombol inline dilampirkan langsung ke pesan foto welcome.
             await ctx.replyWithPhoto(
                 { source: imagePath },
                 {
                     caption: message,
                     parse_mode: 'Markdown',
-                    reply_markup: keyboard.reply_markup
+                    reply_markup: inlineKeyboard.reply_markup
                 }
             );
         } else {
-            await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+            await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: inlineKeyboard.reply_markup });
         }
 
     } catch (error) {
         console.error('Error in /start:', error);
         // Fallback terakhir: kirim tanpa Markdown supaya user tetap dapat menu.
         try {
-            const { message, keyboard } = await generateStartMessageAndKeyboard(ctx);
+            const { message, inlineKeyboard } = await generateStartMessageAndKeyboard(ctx);
             const plain = message
                 .replace(/\\([_*`\[\]])/g, '$1')  // buang backslash hasil escapeMd
                 .replace(/[*`]/g, '');
-            await ctx.reply(plain, { reply_markup: keyboard.reply_markup });
+            await ctx.reply(plain, { reply_markup: inlineKeyboard.reply_markup });
         } catch (fallbackError) {
             console.error('Error in /start fallback:', fallbackError);
             await ctx.reply('❌ Terjadi kesalahan saat memulai bot.');
         }
+    }
+});
+
+// Aksi INLINE untuk tombol pada /start (mirror tombol menu bawah).
+bot.action('show_stock', async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        const { message, keyboard } = await generateStockMessageAndKeyboard();
+        await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+    } catch (error) {
+        console.error('Error in show_stock:', error);
+        try { await ctx.answerCbQuery('❌ Gagal memuat stok.', { show_alert: true }); } catch (e) {}
+    }
+});
+
+bot.action('show_history', async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        const userId = ctx.from.id.toString();
+        const userPaidOrders = await Order.find({ "customerInfo.telegramUserId": userId, status: 'PAID' }).lean();
+        if (userPaidOrders.length === 0) {
+            return ctx.reply('Anda belum memiliki riwayat transaksi yang berhasil.');
+        }
+        const purchaseSummary = {};
+        userPaidOrders.forEach(order => {
+            const key = `${order.productName} ${order.variantName}`;
+            purchaseSummary[key] = (purchaseSummary[key] || 0) + order.quantity;
+        });
+        let message = `📋 *RIWAYAT PEMBELIAN ANDA*\nTotal Transaksi Berhasil: ${userPaidOrders.length}\n────────────✧\n`;
+        Object.entries(purchaseSummary).forEach(([itemName, qty], index) => {
+            message += `${index + 1}. ${itemName} x ${qty}\n`;
+        });
+        message += `────────────✧`;
+        await ctx.reply(message, { parse_mode: 'Markdown' });
+    } catch (error) {
+        console.error('Error in show_history:', error);
+        await ctx.reply('❌ Gagal mengambil riwayat transaksi.');
+    }
+});
+
+bot.action('open_admin', async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        const ADMIN_IDS = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
+        if (!ADMIN_IDS.includes(ctx.from.id.toString())) {
+            return ctx.answerCbQuery('Menu ini hanya untuk admin.', { show_alert: true }).catch(() => {});
+        }
+        const { message, keyboard } = await adminModule.getAdminMenuMessageAndKeyboard();
+        await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+    } catch (error) {
+        console.error('Error in open_admin:', error);
+        await ctx.reply('❌ Terjadi kesalahan saat membuka panel admin.');
     }
 });
 
