@@ -1268,37 +1268,30 @@ async function generateQuantityMessageAndKeyboard(productId, variantSlug, quanti
                   `💵 *Total Harga:* Rp ${totalHarga.toLocaleString('id-ID')}` +
                   `${discountMessage}\n` +
                   `────────────✧\n` +
-                  `_Silakan atur jumlah pembelian menggunakan tombol +/- di bawah._`;
-    
-    // Pola callback BARU menggunakan ':' sebagai pemisah: qtymod:{productId}:{variantSlug}:{change}:{qty}:{page}
-    const qtyButtons = [
-        Markup.button.callback(`➖`, `qty_mod:${productId}:${variantSlug}:-1:${quantity}:${page}`), // <-- DIUBAH
-        Markup.button.callback(`${quantity}`, 'ignore_me'),
-    ];
+                  `_Pilih jumlah pembelian dengan menekan tombol angka di bawah. Butuh lebih dari 10? Tekan "Custom"._`;
 
-    if (quantity < maxStock) {
-        qtyButtons.push(Markup.button.callback(`➕`, `qty_mod:${productId}:${variantSlug}:1:${quantity}:${page}`)); // <-- DIUBAH
+    // ==== TOMBOL ANGKA LANGSUNG (1..10) + CUSTOM ====
+    // Pola callback: qty_set:{productId}:{variantSlug}:{qty}:{page}
+    const keyboard = [];
+    const maxButton = Math.min(10, maxStock);   // tampilkan angka sampai 10 atau sebatas stok
+    const numberButtons = [];
+    for (let n = 1; n <= maxButton; n++) {
+        const label = (n === quantity) ? `✅ ${n}` : `${n}`; // tandai jumlah yang sedang dipilih
+        numberButtons.push(Markup.button.callback(label, `qty_set:${productId}:${variantSlug}:${n}:${page}`));
+    }
+    // Susun 5 tombol per baris agar rapi
+    for (let i = 0; i < numberButtons.length; i += 5) {
+        keyboard.push(numberButtons.slice(i, i + 5));
     }
 
-    const keyboard = [
-        qtyButtons,
-        [Markup.button.callback('Lanjutkan ke Pembayaran ➡️', `proceed_payment:${productId}:${variantSlug}:${quantity}:${page}`)], // <-- DIUBAH
-        [Markup.button.callback('🔄 Kembali', `back_to_details_${productId}_page_${page}`)]
-    ];
-
-    if (maxStock >= 5) { 
-        const shortcutRow = [];
-        if (quantity > 5) {
-            shortcutRow.push(Markup.button.callback(`-5`, `qty_mod:${productId}:${variantSlug}:-5:${quantity}:${page}`)); // <-- DIUBAH
-        }
-        if (quantity + 5 <= maxStock) {
-            shortcutRow.push(Markup.button.callback(`+5`, `qty_mod:${productId}:${variantSlug}:5:${quantity}:${page}`)); // <-- DIUBAH
-        }
-
-        if (shortcutRow.length > 0) {
-            keyboard.splice(1, 0, shortcutRow);
-        }
+    // Tombol Custom hanya berguna jika stok > 10 (untuk jumlah di luar 1-10)
+    if (maxStock > 10) {
+        const customLabel = (quantity > 10) ? `✍️ Custom (${quantity})` : `✍️ Custom`;
+        keyboard.push([Markup.button.callback(customLabel, `qty_custom:${productId}:${variantSlug}:${page}`)]);
     }
+
+    keyboard.push([Markup.button.callback('Lanjutkan ke Pembayaran ➡️', `proceed_payment:${productId}:${variantSlug}:${quantity}:${page}`)]);
+    keyboard.push([Markup.button.callback('🔄 Kembali', `back_to_details_${productId}_page_${page}`)]);
 
     return { message, keyboard: Markup.inlineKeyboard(keyboard) };
 }
@@ -1587,6 +1580,69 @@ bot.action(/^qty_mod:([^:]+):(.+):(-?\d+):(\d+):(\d+)$/, async (ctx) => {
     } catch (error) {
         console.error('Error in qty_mod buttons:', error);
         await ctx.answerCbQuery('❌ Terjadi kesalahan saat mengubah jumlah.', { show_alert: true });
+    }
+});
+
+// ==== PILIH JUMLAH LANGSUNG lewat tombol angka: qty_set:{productId}:{variantSlug}:{qty}:{page} ====
+bot.action(/^qty_set:([^:]+):(.+):(\d+):(\d+)$/, async (ctx) => {
+    try {
+        const [, productId, variantSlug, qtyStr, pageStr] = ctx.match;
+        let newQty = parseInt(qtyStr, 10);
+        const page = parseInt(pageStr, 10);
+
+        const { variant } = await findProductAndVariant(productId, variantSlug);
+        if (!variant) {
+            return await ctx.answerCbQuery('❌ Varian produk tidak ditemukan.', { show_alert: true });
+        }
+
+        const maxStock = variant.stock.length;
+        if (newQty < 1) newQty = 1;
+        if (newQty > maxStock) {
+            await ctx.answerCbQuery(`⚠️ Stok tidak mencukupi. Sisa stok: ${maxStock}`, { show_alert: true });
+            newQty = maxStock;
+        } else {
+            await ctx.answerCbQuery();
+        }
+
+        const { message, keyboard } = await generateQuantityMessageAndKeyboard(productId, variantSlug, newQty, page);
+        try {
+            if (ctx.callbackQuery.message.photo) {
+                await ctx.editMessageCaption(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+            } else {
+                await ctx.editMessageText(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+            }
+        } catch (e) {
+            if (!e.message.includes('message is not modified')) {
+                console.error('Error updating quantity message (qty_set):', e);
+            }
+        }
+    } catch (error) {
+        console.error('Error in qty_set buttons:', error);
+        await ctx.answerCbQuery('❌ Terjadi kesalahan saat memilih jumlah.', { show_alert: true });
+    }
+});
+
+// ==== CUSTOM JUMLAH: minta user mengetik angka. qty_custom:{productId}:{variantSlug}:{page} ====
+bot.action(/^qty_custom:([^:]+):(.+):(\d+)$/, async (ctx) => {
+    try {
+        const [, productId, variantSlug, pageStr] = ctx.match;
+        const page = parseInt(pageStr, 10);
+        const userId = ctx.from.id.toString();
+
+        const { variant } = await findProductAndVariant(productId, variantSlug);
+        if (!variant) {
+            return await ctx.answerCbQuery('❌ Varian produk tidak ditemukan.', { show_alert: true });
+        }
+        const maxStock = variant.stock.length;
+
+        // Simpan konteks agar handler teks tahu ini input jumlah custom
+        userStates[userId] = { state: 'awaiting_custom_qty', productId, variantSlug, page, maxStock };
+
+        await ctx.answerCbQuery();
+        await ctx.reply(`✍️ Ketik jumlah yang Anda inginkan (1 - ${maxStock}), lalu kirim.\n\nContoh: 15`);
+    } catch (error) {
+        console.error('Error in qty_custom button:', error);
+        await ctx.answerCbQuery('❌ Terjadi kesalahan.', { show_alert: true });
     }
 });
 
@@ -2468,7 +2524,30 @@ bot.hears(/^[^\/]/, async (ctx) => {
     if (!userState) return;
     
     try {
-        if (userState.state === 'awaiting_stock') {
+        if (userState.state === 'awaiting_custom_qty') {
+            const { productId, variantSlug, page } = userState;
+            let qty = parseInt(String(ctx.message.text).replace(/\D/g, ''), 10);
+
+            // Ambil stok terkini (mungkin berubah sejak tombol ditekan)
+            const { variant } = await findProductAndVariant(productId, variantSlug);
+            const maxStock = variant ? variant.stock.length : 0;
+
+            if (!variant || maxStock === 0) {
+                delete userStates[userId];
+                return ctx.reply('❌ Maaf, stok varian ini sudah habis. Silakan pilih produk lain.');
+            }
+            if (isNaN(qty) || qty < 1) {
+                return ctx.reply(`❌ Jumlah tidak valid. Ketik angka antara 1 - ${maxStock}.`);
+            }
+            if (qty > maxStock) {
+                return ctx.reply(`⚠️ Stok hanya tersisa ${maxStock}. Ketik angka antara 1 - ${maxStock}.`);
+            }
+
+            delete userStates[userId];
+            const { message, keyboard } = await generateQuantityMessageAndKeyboard(productId, variantSlug, qty, page);
+            await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+
+        } else if (userState.state === 'awaiting_stock') {
             const stockToAdd = ctx.message.text.split('\n').filter(line => line.trim() !== '');
             await adminModule.addStock(userState.productId, userState.variantSlug, stockToAdd, ctx);
             delete userStates[userId];
