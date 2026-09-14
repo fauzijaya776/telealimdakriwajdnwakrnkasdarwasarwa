@@ -22,6 +22,7 @@ const { connectDB, User, Product, Order, Settings, slimPaymentDetails } = requir
 const dana = require('./qris_dana');
 const tokopay = require('./qris_tokopay');
 const qrin = require('./qris_qrin');
+const pakasir = require('./qris_pakasir');
 const linkqu = require('./qris_linkqu');
 const adminModule = require('./admin');
 const QRCode = require('qrcode');
@@ -41,15 +42,22 @@ const paymentSessions = new Map();
 
 // -----------------------------------------------------------------
 // FORMAT TAMPILAN AKUN UNTUK CUSTOMER
-// DigitalOcean (dop_v1|email|password|2fa) -> berlabel; produk biasa
-// dgn pembatas '|' -> tiap bagian ke baris sendiri; tanpa pembatas -> apa adanya.
+// Khusus produk DigitalOcean: item disimpan sebagai
+//   dop_v1xxx|email|password|2fa   (pisah '|', 2fa opsional)
+// Ditampilkan berlabel rapi:
+//   api key = ...
+//   email = ...
+//   password = ...
+//   2fa = ...
+// Item produk lain ditampilkan apa adanya (tidak diubah).
 // -----------------------------------------------------------------
 function formatAccountItem(item) {
     if (!item || typeof item !== 'string') return item;
     const allLines = item.split(/\r?\n/);
     const firstLine = allLines[0];
-    const extra = allLines.slice(1).filter((l) => l.trim());
+    const extra = allLines.slice(1).filter((l) => l.trim()); // baris tambahan (kalau ada)
 
+    // --- Produk DigitalOcean: tampilkan berlabel ---
     if (firstLine.includes('dop_v1')) {
         const parts = firstLine.split('|').map((p) => p.trim());
         const labels = ['api key', 'email', 'password', '2fa'];
@@ -63,6 +71,7 @@ function formatAccountItem(item) {
         return out.join('\n');
     }
 
+    // --- Produk biasa: pecah tiap bagian pembatas '|' ke baris sendiri ---
     if (firstLine.includes('|')) {
         const parts = firstLine.split('|').map((p) => p.trim()).filter(Boolean);
         const out = [...parts];
@@ -70,9 +79,11 @@ function formatAccountItem(item) {
         return out.join('\n');
     }
 
+    // --- Tidak ada pembatas: biarkan apa adanya ---
     return item;
 }
 
+// Untuk pesan chat (di dalam code block). Beri nomor bila lebih dari 1 item.
 function formatItemsForCustomer(items) {
     if (!Array.isArray(items)) return '';
     if (items.length === 1) return formatAccountItem(items[0]);
@@ -86,6 +97,7 @@ function formatItemsForCustomer(items) {
         .join(sep);
 }
 
+// Untuk file .txt (pembelian jumlah banyak). Tiap akun dipisah baris kosong.
 function formatItemsForFile(items) {
     if (!Array.isArray(items)) return '';
     return items.map(formatAccountItem).join('\n\n');
@@ -195,7 +207,7 @@ async function sendAdminNotification(bot, order) {
         await bot.telegram.sendMessage(GROUP_NOTIF_ID, message, { parse_mode: 'Markdown' });
 
         // 2. Buat dan Kirim File .txt
-        const fileContent = order.reservedItems.join('\n');
+        const fileContent = formatItemsForFile(order.reservedItems);
         const fileName = `akun_${order.orderId}.txt`;
 
         await bot.telegram.sendDocument(
@@ -211,9 +223,14 @@ async function sendAdminNotification(bot, order) {
 
 // =================================================================
 // PENGIRIMAN AKUN KE CUSTOMER — TAHAN BANTING
-// Menangani "sudah bayar tapi akun tidak terkirim": coba Markdown ->
-// fallback teks biasa -> kalau tetap gagal, LAPOR owner + file akun untuk
-// dikirim manual, dan order tidak ditandai delivered. Tidak pernah melempar.
+// Menangani kasus "sudah bayar tapi akun tidak terkirim":
+//   1. Kirim pakai Markdown. Kalau gagal (mis. karakter merusak format
+//      Markdown), coba ulang sebagai teks biasa.
+//   2. Kalau tetap gagal (mis. customer blokir bot), LAPOR ke OWNER
+//      lengkap dengan file akunnya supaya bisa dikirim manual, dan order
+//      TIDAK ditandai terkirim (delivered tetap false) untuk audit.
+//   3. Kalau sukses, tandai order delivered=true.
+// Fungsi ini TIDAK PERNAH melempar error (aman dipanggil di dalam polling).
 // =================================================================
 function ownerIdList() {
     return (process.env.OWNER_ID || '').split(',').map((id) => id.trim()).filter(Boolean);
@@ -239,7 +256,7 @@ async function alertOwnerDeliveryFailed(order, reason) {
         `Jumlah: ${order.quantity}x`,
         `Sebab: ${reason}`,
         '',
-        `Kirim manual akun di file berikut, lalu jalankan \`/resend ${order.orderId}\`.`,
+        `Kirim manual akun di file berikut, lalu jalankan \`/resend ${order.orderId}\` bila customer sudah bisa menerima.`,
     ].join('\n');
     const fileContent = formatItemsForFile(order.reservedItems || []);
     for (const o of owners) {
@@ -252,13 +269,15 @@ async function alertOwnerDeliveryFailed(order, reason) {
     }
 }
 
+// Kirim satu pesan: coba Markdown dulu, fallback ke teks biasa.
+// Melempar error hanya jika teks biasa pun gagal (mis. bot diblokir).
 async function sendMessageWithFallback(chatId, markdownMsg) {
     try {
         await bot.telegram.sendMessage(chatId, markdownMsg, { parse_mode: 'Markdown' });
     } catch (e) {
         console.warn(`[DELIVERY] Markdown gagal (${e.message}), coba teks biasa...`);
         const plain = markdownMsg.replace(/```/g, '').replace(/[*_`]/g, '');
-        await bot.telegram.sendMessage(chatId, plain);
+        await bot.telegram.sendMessage(chatId, plain); // tanpa parse_mode
     }
 }
 
@@ -269,29 +288,28 @@ async function deliverAccountsToCustomer(order, methodLabel) {
         return false;
     }
 
+    // Ambil SNK produk (kalau ada).
     let snk = null;
     try {
         const product = await Product.findOne({ id: order.productId });
         const variant = product ? product.variants.find((v) => v.slug === order.variantSlug) : null;
         snk = variant && variant.snk ? variant.snk : null;
-    } catch (e) { /* SNK opsional */ }
+    } catch (e) { /* abaikan, SNK opsional */ }
     const hasSnk = snk && snk.trim() !== '' && snk.trim() !== '-';
 
-    // Branding ALIM STORE dipertahankan.
     const infoLine =
         `*Info Pembelian:*\n– Total: Rp ${Number(order.amount).toLocaleString('id-ID')}\n` +
         `– Metode: ${methodLabel}\n– ID Transaksi: \`${order.orderId}\``;
-    const header = `🧾 *Pembelian Berhasil*\n\nTerima kasih!, Jika Ada Pertanyaan Silahkan Chat Admin Di wa.me/6285753323094\n\n`;
 
     try {
         if (order.quantity < 10) {
             const formattedItems = formatItemsForCustomer(order.reservedItems);
-            let msg = header + `${infoLine}\n\n` +
+            let msg = `🧾 *Pembelian Berhasil*\n\nTerima kasih!\n\n${infoLine}\n\n` +
                 "```\n" + `${order.productName.toUpperCase()}\n${formattedItems}` + "\n```";
             if (hasSnk) msg += `\n\n*Syarat & Ketentuan (SNK):*\n${snk}`;
             await sendMessageWithFallback(chatId, msg);
         } else {
-            let msg = header + `${infoLine}\n\n` +
+            let msg = `🧾 *Pembelian Berhasil*\n\nTerima kasih!\n\n${infoLine}\n\n` +
                 `Anda membeli *${order.quantity}* item. Akun Anda dikirim dalam file terpisah.`;
             if (hasSnk) msg += `\n\n*Syarat & Ketentuan (SNK):*\n${snk}`;
             await sendMessageWithFallback(chatId, msg);
@@ -365,7 +383,7 @@ app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 
 app.use(bodyParser.urlencoded({ extended: true }));
-// verify: simpan body mentah untuk validasi tanda tangan webhook QRIN.
+// verify: simpan body mentah untuk validasi tanda tangan webhook QRIN (HMAC atas raw body).
 app.use(bodyParser.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(session({
     secret: 'telegram-bot-admin-secret-key-super-aman',
@@ -407,113 +425,18 @@ app.get('/logout', (req, res) => {
 });
 
 // --- Rute API untuk MENGAMBIL stok ---
-app.post('/api/take-stock', async (req, res) => {
-    try {
-        // Keamanan: wajib menyertakan kunci yang cocok dengan STOCK_API_KEY (.env).
-        // Kirim lewat header 'X-API-Key' atau field 'api_key' di body.
-        const kunci = req.headers['x-api-key'] || (req.body && req.body.api_key);
-        if (!process.env.STOCK_API_KEY || kunci !== process.env.STOCK_API_KEY) {
-            return res.status(401).json({ error: 'Unauthorized: API key tidak valid.' });
-        }
-
-        const { productId, variantSlug, count } = req.body;
-
-        // Validasi input
-        if (!productId || !variantSlug || !count) {
-            return res.status(400).json({ error: 'Input tidak lengkap. Wajib ada: productId, variantSlug, dan count.' });
-        }
-
-        const numCount = parseInt(count, 10);
-        if (isNaN(numCount) || numCount <= 0) {
-            return res.status(400).json({ error: 'Count harus berupa angka positif.' });
-        }
-
-        // Cari produk di database
-        const product = await Product.findOne({ id: productId });
-        if (!product) {
-            return res.status(404).json({ error: 'Produk tidak ditemukan.' });
-        }
-
-        // Cari varian di dalam produk
-        const variant = product.variants.find(v => v.slug === variantSlug);
-        if (!variant) {
-            return res.status(404).json({ error: 'Varian tidak ditemukan.' });
-        }
-
-        // Cek ketersediaan stok
-        if (variant.stock.length < numCount) {
-            return res.status(400).json({ 
-                error: 'Stok tidak mencukupi.',
-                available_stock: variant.stock.length 
-            });
-        }
-
-        // Ambil sejumlah akun dari awal array dan hapus
-        const takenStock = variant.stock.splice(0, numCount);
-
-        // Simpan perubahan ke database
-        await product.save();
-
-        res.json({
-            message: `Berhasil mengambil ${numCount} akun.`,
-            taken_stock: takenStock,
-            remaining_stock: variant.stock.length
-        });
-
-    } catch (error) {
-        console.error("API Take Stock Error:", error);
-        res.status(500).json({ error: 'Terjadi kesalahan pada server.' });
-    }
-});
-
-app.post('/api/return-stock', async (req, res) => {
-    try {
-        // Keamanan: wajib menyertakan kunci yang cocok dengan STOCK_API_KEY (.env).
-        const kunci = req.headers['x-api-key'] || (req.body && req.body.api_key);
-        if (!process.env.STOCK_API_KEY || kunci !== process.env.STOCK_API_KEY) {
-            return res.status(401).json({ error: 'Unauthorized: API key tidak valid.' });
-        }
-
-        const { productId, variantSlug, stockItems } = req.body;
-
-        // Validasi input
-        if (!productId || !variantSlug || !stockItems) {
-            return res.status(400).json({ error: 'Input tidak lengkap. Wajib ada: productId, variantSlug, dan stockItems.' });
-        }
-
-        if (!Array.isArray(stockItems) || stockItems.length === 0) {
-            return res.status(400).json({ error: 'stockItems harus berupa array yang tidak kosong.' });
-        }
-
-        // Cari produk di database
-        const product = await Product.findOne({ id: productId });
-        if (!product) {
-            return res.status(404).json({ error: 'Produk tidak ditemukan.' });
-        }
-
-        // Cari varian di dalam produk
-        const variant = product.variants.find(v => v.slug === variantSlug);
-        if (!variant) {
-            return res.status(404).json({ error: 'Varian tidak ditemukan.' });
-        }
-
-        // Tambahkan item stok kembali ke awal array stok
-        variant.stock.unshift(...stockItems);
-
-        // Simpan perubahan ke database
-        await product.save();
-
-        res.json({
-            message: `Berhasil mengembalikan ${stockItems.length} akun.`,
-            returned_stock: stockItems,
-            current_stock: variant.stock.length
-        });
-
-    } catch (error) {
-        console.error("API Return Stock Error:", error);
-        res.status(500).json({ error: 'Terjadi kesalahan pada server.' });
-    }
-});
+// =================================================================
+// CATATAN KEAMANAN
+// =================================================================
+// Route `/api/take-stock` dan `/api/return-stock` DIHAPUS.
+//
+// Keduanya tidak punya authMiddleware sama sekali, padahal route admin lain
+// punya. Artinya siapa pun yang tahu alamat server ini bisa menguras seluruh
+// stok lewat satu request HTTP, tanpa login.
+//
+// Penggantinya: menu "📤 Ambil Stok" di panel admin Telegram, yang dijaga
+// adminMiddleware (hanya ID di OWNER_ID) dan memakai transaksi MongoDB
+// sehingga aman dari race condition dengan pembelian customer.
 
 app.get('/products/variants/delete/:id/:slug', authMiddleware, async (req, res) => {
     try {
@@ -673,32 +596,33 @@ app.get('/broadcast', authMiddleware, async (req, res) => {
 });
 
 app.post('/broadcast/send', authMiddleware, upload.single('image_file'), async (req, res) => {
-    const { broadcast_type, content, image_url, image_source } = req.body;
+    const { broadcast_type, content, image_url, image_source, include_buttons } = req.body;
+    // Checkbox "Sertakan tombol" -> lampirkan tombol inline (Lihat Produk / Cek
+    // Stok / Riwayat) di bawah pesan promo, sama seperti /start.
+    const buttonExtra = include_buttons ? { reply_markup: getPromoInlineKeyboard().reply_markup } : {};
     try {
-        const photo = (broadcast_type === 'image_with_text')
-            ? ((image_source === 'url')
-                ? image_url
-                : { source: path.join(__dirname, 'public', 'uploads', req.file.filename) })
-            : null;
-
-        // Memakai mesin broadcast yang sama dengan bot: ada jeda antar kirim
-        // (anti 429), fallback teks biasa kalau Markdown rusak, dan daftar
-        // stok + tombol beli otomatis ikut terkirim.
-        const result = await runBroadcast(bot.telegram, {
-            text: content,
-            photo,
-            attachStock: true
-        });
-
-        if (req.file) {
-            await fs.unlink(req.file.path).catch(() => {});
+        const users = await User.find({}, 'id');
+        const userIds = users.map(user => user.id);
+        let successCount = 0;
+        let failCount = 0;
+        for (const userId of userIds) {
+            try {
+                if (broadcast_type === 'text_only') {
+                    await bot.telegram.sendMessage(userId, content, { parse_mode: 'Markdown', ...buttonExtra });
+                } else if (broadcast_type === 'image_with_text') {
+                    let imageToSend = (image_source === 'url') ? image_url : { source: path.join(__dirname, 'public', 'uploads', req.file.filename) };
+                    await bot.telegram.sendPhoto(userId, imageToSend, { caption: content, parse_mode: 'Markdown', ...buttonExtra });
+                }
+                successCount++;
+            } catch (e) {
+                console.error(`Failed to send broadcast to ${userId}:`, e.message);
+                failCount++;
+            }
         }
-
-        let summary = `Broadcast terkirim ke ${result.success} dari ${result.total} user.`;
-        summary += ` Memblokir bot: ${result.blocked}. Gagal lain: ${result.failed}.`;
-        if (result.stockAttached) summary += ' Daftar stok + tombol beli ikut terkirim.';
-        if (result.markdownDisabled) summary += ' (Markdown tidak valid, dikirim sebagai teks biasa.)';
-        res.redirect(`/broadcast?success=${encodeURIComponent(summary)}`);
+        if (req.file) {
+            await fs.unlink(req.file.path);
+        }
+        res.redirect(`/broadcast?success=Broadcast sent to ${successCount} users. Failed for ${failCount} users.`);
     } catch (error) {
         console.error('Broadcast error:', error);
         res.redirect(`/broadcast?error=An error occurred during broadcast.`);
@@ -872,17 +796,17 @@ async function generateStartMessageAndKeyboard(ctx) {
     const displayName = escapeMd(ctx.from.first_name || 'User');
     const displayUsername = escapeMd(user.username || ctx.from.username || 'N/A');
 
-    const message = `👋 — Hello ${displayName} Selamat Datang Di ALIM STORE\n\n` +
+    const message = `👋 — Hello ${displayName} Selamat Datang Di FZI STORE\n\n` +
                     `🗓️ ${new Date().toLocaleDateString('id-ID', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' })}\n\n` +
                     `*User Details :*\n` +
                     `├ ID : \`${userId}\`\n` +
                     `├ Username : @${displayUsername}\n` +
                     `└ Total Spent : ${totalSpentRp}\n\n` +
                     `*BOT Statistics*\n\n` +
-                    `├ Products Sold : ${9132 + productsSoldCount} Accounts\n` +
-                    `└ Total Users : ${1087 + totalUsers} Users\n\n` +
+                    `├ Products Sold : ${7125 + productsSoldCount} Accounts\n` +
+                    `└ Total Users : ${1026 + totalUsers} Users\n\n` +
                     `Silahkan tekan tombol '🛒 List Produk'\n` +
-                    `Bot Ubah Vps Ke Rdp (installer rdp) @fzistorebot\n`;
+                    `Bot Create VPS DO Via API & Ubah Vps Ke Rdp (installer rdp) @fzistorebot\n`;
 
     // FIX BUG: OWNER_ID yang belum diset membuat .split() melempar TypeError.
     const ADMIN_IDS = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
@@ -890,9 +814,9 @@ async function generateStartMessageAndKeyboard(ctx) {
     const keyboardLayout = [['🛒 List Produk', '🧾 Riwayat Transaksi'], ['📦 Cek Stok']];
     if (isAdmin) keyboardLayout.push(['⚙️ Admin Panel']);
 
-    // Tombol INLINE di bawah teks /start (mirip tombol pada /stock), biar
-    // customer bisa langsung tekan tanpa mengetik. Memakai action yang ada:
-    // list_products_1, show_stock, show_history, open_admin.
+    // Tombol INLINE di bawah teks /start (mirip tombol pada /stock).
+    // 'Lihat Produk' memakai action yang sudah ada (list_products_1);
+    // 'Cek Stok' & 'Riwayat Transaksi' memakai action baru show_stock / show_history.
     const inlineRows = [
         [
             Markup.button.callback('🛒 Lihat Produk', 'list_products_1'),
@@ -909,6 +833,18 @@ async function generateStartMessageAndKeyboard(ctx) {
     };
 }
 
+// Tombol INLINE untuk pesan broadcast/promo (versi customer, tanpa tombol admin).
+// Memakai action yang sama dgn /start, jadi siapa pun yang menekan langsung jalan.
+function getPromoInlineKeyboard() {
+    return Markup.inlineKeyboard([
+        [
+            Markup.button.callback('🛒 Lihat Produk', 'list_products_1'),
+            Markup.button.callback('📦 Cek Stok', 'show_stock'),
+        ],
+        [Markup.button.callback('🧾 Riwayat Transaksi', 'show_history')],
+    ]);
+}
+
 async function generateProductListMessageAndKeyboard(page = 1) {
     const productsPerPage = 10;
     const totalProducts = await Product.countDocuments();
@@ -923,10 +859,7 @@ async function generateProductListMessageAndKeyboard(page = 1) {
     } else {
         products.forEach((p, index) => {
             const productNumber = (page - 1) * productsPerPage + index + 1;
-            const variants = Array.isArray(p.variants) ? p.variants : [];
-            const totalStock = variants.reduce((sum, v) => sum + (Array.isArray(v.stock) ? v.stock.length : 0), 0);
-            const stockEmoji = totalStock > 0 ? '✅' : '❌';
-            message += `${stockEmoji} *[${productNumber}]* ${escapeMd(String(p.name || '-').toUpperCase())} → x${totalStock}\n`;
+            message += `*[${productNumber}]* ${escapeMd(String(p.name || '-').toUpperCase())}\n`;
             keyboardButtons.push(Markup.button.callback(`${productNumber}`, `show_product_${p.id}_page_${page}`));
         });
     }
@@ -1000,180 +933,6 @@ async function generateStockMessageAndKeyboard() {
 async function generateStockTextMessage() {
     const { message } = await generateStockMessageAndKeyboard();
     return message;
-}
-
-// =============================================================
-// MESIN BROADCAST
-// =============================================================
-// Telegram membatasi bot ~30 pesan/detik untuk pengiriman massal. Loop lama
-// mengirim tanpa jeda sama sekali sehingga kena 429 (Too Many Requests), dan
-// error itu merembet ke pesan status di akhir -> muncul "Terjadi kesalahan"
-// padahal pesannya sendiri sudah terkirim.
-const BROADCAST_DELAY_MS = parseInt(process.env.BROADCAST_DELAY_MS || '40', 10);
-const TELEGRAM_TEXT_LIMIT = 4096;
-const TELEGRAM_CAPTION_LIMIT = 1024;
-
-const broadcastSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// Dipakai saat Markdown terpaksa dimatikan: buang penanda format supaya user
-// tidak melihat bintang dan backtick mentah di pesannya.
-function toPlainText(text) {
-    return String(text || '')
-        .replace(/\\([_*`\[\]])/g, '$1')
-        .replace(/[*`]/g, '');
-}
-
-// Telegraf menaruh detail error di tempat berbeda tergantung versi.
-function telegramErrorInfo(error) {
-    const response = (error && error.response) || {};
-    const parameters = response.parameters || (error && error.parameters) || {};
-    return {
-        code: response.error_code || (error && error.code),
-        description: String(response.description || (error && error.description) || (error && error.message) || ''),
-        retryAfter: parameters.retry_after
-    };
-}
-
-// Kirim satu pesan dengan penanganan 429 (tunggu sesuai perintah Telegram)
-// dan Markdown rusak (kirim ulang sebagai teks biasa).
-async function sendWithRetry(chatId, sendFn, state) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-            await sendFn(state.useMarkdown);
-            return { ok: true };
-        } catch (error) {
-            const info = telegramErrorInfo(error);
-
-            // 429: Telegram memberi tahu harus menunggu berapa detik.
-            if (info.code === 429 && info.retryAfter) {
-                await broadcastSleep((info.retryAfter + 1) * 1000);
-                continue;
-            }
-            // Markdown admin tidak valid -> matikan Markdown untuk sisa broadcast
-            // supaya pesan tetap sampai, bukan gagal semua.
-            if (info.description.includes('parse entities') && state.useMarkdown) {
-                state.useMarkdown = false;
-                state.markdownDisabled = true;
-                continue;
-            }
-            // User memblokir bot / akun dihapus: kegagalan permanen, bukan error.
-            if (info.code === 403 ||
-                info.description.includes('bot was blocked') ||
-                info.description.includes('user is deactivated') ||
-                info.description.includes('chat not found')) {
-                return { ok: false, blocked: true };
-            }
-            return { ok: false, error: info.description };
-        }
-    }
-    return { ok: false, error: 'gagal setelah percobaan ulang' };
-}
-
-// Jalankan broadcast ke semua user, lengkap dengan daftar stok + tombol beli.
-// Mengembalikan ringkasan; TIDAK pernah melempar error ke pemanggil.
-async function runBroadcast(telegram, options) {
-    const opts = options || {};
-    const text = opts.text || '';
-    const photo = opts.photo || null;
-    const attachStock = opts.attachStock !== false;
-    const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
-
-    const result = {
-        total: 0, success: 0, failed: 0, blocked: 0,
-        markdownDisabled: false, stockAttached: false
-    };
-
-    // Daftar stok dihitung SEKALI saja, bukan per user.
-    let stockMessage = null;
-    let stockKeyboard = null;
-    if (attachStock) {
-        try {
-            const stock = await generateStockMessageAndKeyboard();
-            stockMessage = stock.message;
-            stockKeyboard = stock.keyboard;
-            result.stockAttached = true;
-        } catch (error) {
-            console.error('Broadcast: gagal memuat daftar stok:', error.message);
-        }
-    }
-
-    // Kalau muat, gabungkan jadi SATU pesan supaya user tidak dapat 2 notifikasi.
-    const combined = (text && stockMessage) ? (text + '\n\n' + stockMessage) : null;
-    const canCombine = !photo && combined !== null && combined.length <= TELEGRAM_TEXT_LIMIT - 96;
-
-    const users = await User.find({ id: { $exists: true, $ne: null } }, 'id').lean();
-    const userIds = users.map((u) => u.id).filter(Boolean);
-    result.total = userIds.length;
-
-    const state = { useMarkdown: true, markdownDisabled: false };
-
-    for (let i = 0; i < userIds.length; i++) {
-        const chatId = userIds[i];
-        let delivered = false;
-        let blocked = false;
-
-        // --- Pesan utama ---
-        if (photo) {
-            const caption = text.length > TELEGRAM_CAPTION_LIMIT
-                ? text.slice(0, TELEGRAM_CAPTION_LIMIT - 1)
-                : text;
-            const outcome = await sendWithRetry(chatId, (useMarkdown) =>
-                telegram.sendPhoto(chatId, photo, useMarkdown
-                    ? { caption, parse_mode: 'Markdown' }
-                    : { caption: toPlainText(caption) }), state);
-            delivered = outcome.ok;
-            blocked = !!outcome.blocked;
-        } else {
-            const body = canCombine ? combined : text;
-            const extra = (canCombine && stockKeyboard)
-                ? { reply_markup: stockKeyboard.reply_markup }
-                : {};
-            const outcome = await sendWithRetry(chatId, (useMarkdown) =>
-                telegram.sendMessage(chatId, useMarkdown ? body : toPlainText(body), useMarkdown
-                    ? Object.assign({ parse_mode: 'Markdown' }, extra)
-                    : Object.assign({}, extra)), state);
-            delivered = outcome.ok;
-            blocked = !!outcome.blocked;
-        }
-
-        // --- Daftar stok sebagai pesan kedua (kalau tidak muat digabung) ---
-        if (delivered && stockMessage && !canCombine) {
-            await broadcastSleep(BROADCAST_DELAY_MS);
-            await sendWithRetry(chatId, (useMarkdown) =>
-                telegram.sendMessage(chatId, useMarkdown ? stockMessage : toPlainText(stockMessage), useMarkdown
-                    ? { parse_mode: 'Markdown', reply_markup: stockKeyboard.reply_markup }
-                    : { reply_markup: stockKeyboard.reply_markup }), state);
-        }
-
-        if (delivered) result.success += 1;
-        else if (blocked) result.blocked += 1;
-        else result.failed += 1;
-
-        if (onProgress && (i + 1) % 50 === 0) {
-            try { await onProgress(i + 1, result); } catch (e) {}
-        }
-
-        // Jeda antar user: inilah yang mencegah 429.
-        if (i < userIds.length - 1) await broadcastSleep(BROADCAST_DELAY_MS);
-    }
-
-    result.markdownDisabled = state.markdownDisabled;
-    return result;
-}
-
-function formatBroadcastSummary(result) {
-    let summary = `🚀 *Broadcast Selesai*\n\n` +
-        `✅ Berhasil terkirim: ${result.success} pengguna\n` +
-        `🚫 Memblokir bot / akun hilang: ${result.blocked} pengguna\n` +
-        `❌ Gagal lain: ${result.failed} pengguna\n` +
-        `👥 Total user: ${result.total}`;
-    if (result.stockAttached) {
-        summary += `\n\n📦 Daftar stok + tombol beli ikut terkirim.`;
-    }
-    if (result.markdownDisabled) {
-        summary += `\n\n⚠️ Format Markdown pesanmu tidak valid, jadi pesan dikirim sebagai teks biasa.`;
-    }
-    return summary;
 }
 
 async function generateProductDetailsMessageAndKeyboard(productId, page) {
@@ -1333,7 +1092,8 @@ async function generatePaymentMessageAndKeyboard(productId, variantSlug, quantit
         //row1.push(Markup.button.callback('DANA', `dana_${productId}_${variantSlug}_${quantity}`));
     //}
     if (settings.tokopay_enabled) {
-        row2.push(Markup.button.callback('QRIS (ALL)', `tokopay_${productId}_${variantSlug}_${quantity}`));
+        // QRIS (ALL) kini memakai Pakasir sebagai payment gateway.
+        row2.push(Markup.button.callback('QRIS (ALL)', `pakasir_${productId}_${variantSlug}_${quantity}`));
     }
 
     //if (row1.length > 0) keyboardRows.push(row1);
@@ -1375,7 +1135,7 @@ bot.start(async (ctx) => {
         console.error('Error in /start:', error);
         // Fallback terakhir: kirim tanpa Markdown supaya user tetap dapat menu.
         try {
-            const { message, inlineKeyboard } = await generateStartMessageAndKeyboard(ctx);
+            const { message, keyboard, inlineKeyboard } = await generateStartMessageAndKeyboard(ctx);
             const plain = message
                 .replace(/\\([_*`\[\]])/g, '$1')  // buang backslash hasil escapeMd
                 .replace(/[*`]/g, '');
@@ -1387,7 +1147,55 @@ bot.start(async (ctx) => {
     }
 });
 
-// Aksi INLINE untuk tombol pada /start (mirror tombol menu bawah).
+bot.action(/^list_products_(\d+)$/, async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        const page = parseInt(ctx.match[1]);
+        const { message, keyboard } = await generateProductListMessageAndKeyboard(page);
+        const imagePath = path.join(__dirname, 'assets', 'welcome.png');
+        const fileExists = await fs.access(imagePath).then(() => true).catch(() => false);
+
+        if (fileExists) {
+            if (ctx.callbackQuery.message.photo) {
+                await ctx.editMessageCaption(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+            } else {
+                await ctx.deleteMessage();
+                await ctx.replyWithPhoto(
+                    { source: imagePath },
+                    { caption: message, parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+                );
+            }
+        } else {
+            await ctx.editMessageText(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+        }
+    } catch (error) {
+        console.error('Error in list_products:', error);
+    }
+});
+
+bot.action('back_to_start', async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        const { message, keyboard, inlineKeyboard } = await generateStartMessageAndKeyboard(ctx);
+        const imagePath = path.join(__dirname, 'assets', 'welcome.png');
+        const fileExists = await fs.access(imagePath).then(() => true).catch(() => false);
+
+        await ctx.deleteMessage();
+        if (fileExists) {
+            await ctx.replyWithPhoto(
+                { source: imagePath },
+                { caption: message, parse_mode: 'Markdown', reply_markup: inlineKeyboard.reply_markup }
+            );
+        } else {
+            await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: inlineKeyboard.reply_markup });
+        }
+    } catch (error) {
+        console.error('Error in back_to_start:', error);
+    }
+});
+
+// ===== Tombol inline pada pesan /start =====
+// 'Cek Stok' -> tampilkan daftar stok (pesan baru, tidak mengedit foto welcome).
 bot.action('show_stock', async (ctx) => {
     try {
         await ctx.answerCbQuery();
@@ -1399,6 +1207,7 @@ bot.action('show_stock', async (ctx) => {
     }
 });
 
+// 'Riwayat Transaksi' -> ringkasan pembelian user (sama dgn tombol menu bawah).
 bot.action('show_history', async (ctx) => {
     try {
         await ctx.answerCbQuery();
@@ -1424,6 +1233,7 @@ bot.action('show_history', async (ctx) => {
     }
 });
 
+// 'Admin Panel' (khusus admin) -> buka menu admin.
 bot.action('open_admin', async (ctx) => {
     try {
         await ctx.answerCbQuery();
@@ -1439,54 +1249,10 @@ bot.action('open_admin', async (ctx) => {
     }
 });
 
-bot.action(/^list_products_(\d+)$/, async (ctx) => {
-    try {
-        await ctx.answerCbQuery();
-        const page = parseInt(ctx.match[1]);
-        const { message, keyboard } = await generateProductListMessageAndKeyboard(page);
-        const imagePath = path.join(__dirname, 'assets', 'welcome.png');
-        const fileExists = await fs.access(imagePath).then(() => true).catch(() => false);
-
-        if (fileExists) {
-            if (ctx.callbackQuery.message.photo) {
-                await ctx.editMessageCaption(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
-            } else {
-                // Bot hanya boleh menghapus pesannya sendiri dalam 48 jam.
-                // Pesan broadcast lama akan gagal dihapus -> jangan sampai
-                // itu membuat tombolnya mati.
-                await ctx.deleteMessage().catch(() => {});
-                await ctx.replyWithPhoto(
-                    { source: imagePath },
-                    { caption: message, parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
-                );
-            }
-        } else {
-            await ctx.editMessageText(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
-        }
-    } catch (error) {
-        console.error('Error in list_products:', error);
-    }
-});
-
-bot.action('back_to_start', async (ctx) => {
-    try {
-        await ctx.answerCbQuery();
-        const { message, keyboard } = await generateStartMessageAndKeyboard(ctx);
-        const imagePath = path.join(__dirname, 'assets', 'welcome.png');
-        const fileExists = await fs.access(imagePath).then(() => true).catch(() => false);
-
-        await ctx.deleteMessage();
-        if (fileExists) {
-            await ctx.replyWithPhoto(
-                { source: imagePath },
-                { caption: message, parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
-            );
-        } else {
-            await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
-        }
-    } catch (error) {
-        console.error('Error in back_to_start:', error);
-    }
+// Tombol angka di antara ➖ dan ➕ hanya penanda, bukan aksi. Tanpa handler,
+// Telegram tidak pernah dapat balasan dan spinner-nya berputar sampai timeout.
+bot.action('ignore_me', async (ctx) => {
+    try { await ctx.answerCbQuery(); } catch (e) {}
 });
 
 bot.action(/^show_product_([^_]+)_page_(\d+)$/, async (ctx) => {
@@ -1495,24 +1261,14 @@ bot.action(/^show_product_([^_]+)_page_(\d+)$/, async (ctx) => {
         const productId = ctx.match[1];
         const page = parseInt(ctx.match[2]);
         const { message, keyboard } = await generateProductDetailsMessageAndKeyboard(productId, page);
-
-        try {
-            if (ctx.callbackQuery.message.photo) {
-                await ctx.editMessageCaption(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
-            } else {
-                await ctx.editMessageText(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
-            }
-        } catch (editError) {
-            // Pesan broadcast bisa saja sudah tidak bisa diedit (terlalu lama /
-            // sudah dihapus). Jangan biarkan tombolnya terasa mati: kirim
-            // pesan baru saja.
-            const info = telegramErrorInfo(editError);
-            if (info.description.includes('message is not modified')) return;
-            await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+        
+        if (ctx.callbackQuery.message.photo) {
+            await ctx.editMessageCaption(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+        } else {
+            await ctx.editMessageText(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
         }
     } catch (error) {
         console.error('Error in show_product_details:', error);
-        try { await ctx.answerCbQuery('❌ Gagal memuat produk.', { show_alert: true }); } catch (e) {}
     }
 });
 
@@ -1583,69 +1339,6 @@ bot.action(/^qty_mod:([^:]+):(.+):(-?\d+):(\d+):(\d+)$/, async (ctx) => {
     } catch (error) {
         console.error('Error in qty_mod buttons:', error);
         await ctx.answerCbQuery('❌ Terjadi kesalahan saat mengubah jumlah.', { show_alert: true });
-    }
-});
-
-// ==== PILIH JUMLAH LANGSUNG lewat tombol angka: qty_set:{productId}:{variantSlug}:{qty}:{page} ====
-bot.action(/^qty_set:([^:]+):(.+):(\d+):(\d+)$/, async (ctx) => {
-    try {
-        const [, productId, variantSlug, qtyStr, pageStr] = ctx.match;
-        let newQty = parseInt(qtyStr, 10);
-        const page = parseInt(pageStr, 10);
-
-        const { variant } = await findProductAndVariant(productId, variantSlug);
-        if (!variant) {
-            return await ctx.answerCbQuery('❌ Varian produk tidak ditemukan.', { show_alert: true });
-        }
-
-        const maxStock = variant.stock.length;
-        if (newQty < 1) newQty = 1;
-        if (newQty > maxStock) {
-            await ctx.answerCbQuery(`⚠️ Stok tidak mencukupi. Sisa stok: ${maxStock}`, { show_alert: true });
-            newQty = maxStock;
-        } else {
-            await ctx.answerCbQuery();
-        }
-
-        const { message, keyboard } = await generateQuantityMessageAndKeyboard(productId, variantSlug, newQty, page);
-        try {
-            if (ctx.callbackQuery.message.photo) {
-                await ctx.editMessageCaption(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
-            } else {
-                await ctx.editMessageText(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
-            }
-        } catch (e) {
-            if (!e.message.includes('message is not modified')) {
-                console.error('Error updating quantity message (qty_set):', e);
-            }
-        }
-    } catch (error) {
-        console.error('Error in qty_set buttons:', error);
-        await ctx.answerCbQuery('❌ Terjadi kesalahan saat memilih jumlah.', { show_alert: true });
-    }
-});
-
-// ==== CUSTOM JUMLAH: minta user mengetik angka. qty_custom:{productId}:{variantSlug}:{page} ====
-bot.action(/^qty_custom:([^:]+):(.+):(\d+)$/, async (ctx) => {
-    try {
-        const [, productId, variantSlug, pageStr] = ctx.match;
-        const page = parseInt(pageStr, 10);
-        const userId = ctx.from.id.toString();
-
-        const { variant } = await findProductAndVariant(productId, variantSlug);
-        if (!variant) {
-            return await ctx.answerCbQuery('❌ Varian produk tidak ditemukan.', { show_alert: true });
-        }
-        const maxStock = variant.stock.length;
-
-        // Simpan konteks agar handler teks tahu ini input jumlah custom
-        userStates[userId] = { state: 'awaiting_custom_qty', productId, variantSlug, page, maxStock };
-
-        await ctx.answerCbQuery();
-        await ctx.reply(`✍️ Ketik jumlah yang Anda inginkan (1 - ${maxStock}), lalu kirim.\n\nContoh: 15`);
-    } catch (error) {
-        console.error('Error in qty_custom button:', error);
-        await ctx.answerCbQuery('❌ Terjadi kesalahan.', { show_alert: true });
     }
 });
 
@@ -1808,7 +1501,9 @@ bot.action(/^dana_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
                     const order = await Order.findOneAndUpdate(
                         { orderId: internalOrderId, status: 'PENDING' },
                         {
+                            // HEMAT STORAGE: ringkasan saja, bukan payload mentah gateway.
                             $set: { status: 'PAID', paidAt: new Date(), paymentDetails: slimPaymentDetails(statusResult) },
+                            // Order lunas tidak boleh ikut terhapus TTL.
                             $unset: { expiresAt: '' }
                         },
                         { new: true }
@@ -1818,7 +1513,8 @@ bot.action(/^dana_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
                         await Product.updateOne({ id: order.productId, "variants.slug": order.variantSlug }, { $pull: { "variants.$.reserved_stock": { $in: order.reservedItems } } });
                         await User.updateOne({ id: order.customerInfo.telegramUserId }, { $inc: { totalSpent: order.amount } });
 
-                        // Kirim akun via helper tahan-banting (fallback + lapor owner bila gagal).
+                        // Kirim akun ke customer via helper tahan-banting
+                        // (fallback teks biasa + lapor owner bila gagal).
                         await deliverAccountsToCustomer(order, 'DANA');
                     }
                 }
@@ -2076,7 +1772,9 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         qrPhotoMsg = await ctx.replyWithPhoto({ source: qrBuffer }, { caption, parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
 
         // ===== MODE WEBHOOK (QRIN tidak menyediakan endpoint polling) =====
-        // Konfirmasi pembayaran datang dari QRIN via POST /callback -> fulfillQrinPaidOrder().
+        // Konfirmasi pembayaran datang dari QRIN via POST /qrin/callback -> fulfillQrinPaidOrder().
+        // Di sini kita hanya memasang timeout kedaluwarsa: bila sampai batas waktu belum ada
+        // callback "success", stok dikembalikan & order ditandai EXPIRED.
         const pollDuration = 300000; // 5 menit, selaras dengan validity QRIN
         let isHandled = false;
 
@@ -2089,6 +1787,7 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
                 paymentSessions.delete(payment.displayOrderId);
             }
 
+            // Hanya kembalikan stok jika order MASIH pending (hindari bentrok dgn callback sukses).
             const expired = await Order.findOneAndUpdate(
                 { orderId: payment.displayOrderId, status: 'PENDING' },
                 { $set: { status: 'EXPIRED' } }
@@ -2108,6 +1807,7 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         };
 
         const timeoutId = setTimeout(handleExpiry, pollDuration);
+        // Simpan konteks agar handler webhook bisa memenuhi order & menghapus pesan QR.
         paymentSessions.set(payment.displayOrderId, {
             timeoutId,
             qrPhotoMsgId: qrPhotoMsg.message_id,
@@ -2127,6 +1827,13 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         if (workingMsg) await ctx.deleteMessage(workingMsg.message_id).catch(() => {});
         await ctx.reply('❌ Maaf, terjadi kesalahan internal saat membuat invoice. Silakan coba lagi nanti.');
 
+        // DEBUG: kirim penyebab asli ke OWNER agar mudah didiagnosa (tidak terlihat customer lain).
+        const ownerId = process.env.OWNER_ID;
+        if (ownerId) {
+            const detail = (error && error.message) ? error.message : String(error);
+            await bot.telegram.sendMessage(ownerId, `⚠️ [DEBUG QRIN] Gagal membuat invoice:\n${detail}`).catch(() => {});
+        }
+
     } finally {
         session.endSession();
     }
@@ -2134,17 +1841,21 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
 
 // ===== Pemenuhan order yang sudah dibayar (dipanggil oleh webhook QRIN) =====
 async function fulfillQrinPaidOrder(orderId) {
+    // Kunci order: hanya proses jika masih PENDING (idempoten terhadap callback ganda).
     const order = await Order.findOneAndUpdate(
         { orderId: orderId, status: 'PENDING' },
         { $set: { status: 'PAID', paidAt: new Date() }, $unset: { expiresAt: "" } },
         { new: true }
     );
     if (!order) {
+        // Bedakan: callback duplikat (order sudah PAID -> abaikan diam-diam) vs
+        // pembayaran telat pada order yang sudah EXPIRED/CANCELLED (perlu cek manual).
         const existing = await Order.findOne({ orderId: orderId }).lean();
         if (existing && existing.status === 'PAID') return { ok: false, reason: 'already_paid' };
         return { ok: false, reason: 'not_pending' };
     }
 
+    // Hentikan timeout kedaluwarsa & hapus pesan QR.
     const sess = paymentSessions.get(orderId);
     if (sess) {
         clearTimeout(sess.timeoutId);
@@ -2165,48 +1876,259 @@ async function fulfillQrinPaidOrder(orderId) {
     return { ok: true };
 }
 
-// ===== Webhook / Callback QRIN =====
-// Daftarkan URL callback di QRIN ke: https://alimcloud.id/callback
-// Tanda tangan: header X-Callback-Signature = HMAC-SHA256(raw body, QRIN_TOKEN).
-app.get(['/health', '/ping'], (req, res) => res.status(200).json({ status: 'ok', paymentGateway: 'qrin', qrinConfigured: Boolean(process.env.QRIN_TOKEN) }));
+// =================================================================
+// PAKASIR (QRIS ALL) — pengganti QRIN.
+// Konfirmasi pembayaran memakai POLLING ke endpoint transactiondetail
+// (Pakasir menyediakan cek status), jadi TIDAK perlu domain/callback.
+// Webhook Pakasir tetap didukung sebagai cadangan (lihat route /callback).
+// =================================================================
+bot.action(/^pakasir_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
+    let workingMsg, qrPhotoMsg;
+    const productId = ctx.match[1];
+    const variantSlug = ctx.match[2];
+    const quantity = parseInt(ctx.match[3]);
+    const internalOrderId = `P-${ctx.from.id}-${Date.now()}`;
+    let reservedItems = [];
+    const session = await mongoose.startSession();
+    session.startTransaction();
+    let transactionCommitted = false;
 
-app.post(['/callback', '/qrin/callback'], async (req, res) => {
     try {
-        const signature = req.headers['x-callback-signature'];
-        const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body || {}), 'utf8');
-        if (!qrin.verifyCallbackSignature(rawBody, signature)) {
-            console.warn('[QRIN CALLBACK] Signature tidak valid');
-            return res.status(401).json({ success: false, message: 'Invalid signature' });
-        }
-        const data = req.body || {};
-        const orderId = data.no_ref_merchant;
-        const status = String(data.status || '').toLowerCase();
-        console.log(`[QRIN CALLBACK] order=${orderId} status=${status}`);
-        if (!orderId) return res.status(400).json({ success: false, message: 'no_ref_merchant missing' });
+        await ctx.deleteMessage();
+        workingMsg = await ctx.reply('⏳ *Menyiapkan QRIS, mohon tunggu...*', { parse_mode: 'Markdown' });
 
-        if (status === 'success') {
-            const result = await fulfillQrinPaidOrder(orderId);
-            if (!result.ok && result.reason === 'not_pending') {
-                const ownerId = process.env.OWNER_ID;
-                if (ownerId) {
-                    await bot.telegram.sendMessage(ownerId, `⚠️ [QRIN] Pembayaran diterima untuk order \`${orderId}\` tetapi status order bukan PENDING. Perlu cek manual.`, { parse_mode: 'Markdown' }).catch(() => {});
-                }
-            }
+        const product = await Product.findOne({ id: productId }).session(session);
+        if (!product) throw new Error('Produk tidak ditemukan.');
+        const variant = product.variants.find(v => v.slug === variantSlug);
+        if (!variant || !variant.stock || variant.stock.length < quantity) {
+            throw new Error('Maaf, stok tidak mencukupi.');
         }
-        return res.json({ success: true });
-    } catch (e) {
-        console.error('[QRIN CALLBACK] Error:', e.message);
-        return res.status(500).json({ success: false });
+
+        reservedItems = variant.stock.slice(0, quantity);
+        variant.stock.splice(0, quantity);
+        variant.reserved_stock.push(...reservedItems);
+        await product.save({ session });
+
+        let hargaPerPcs = variant.price;
+        if (variant.bulk_pricing && quantity >= variant.bulk_pricing.min_quantity) {
+            hargaPerPcs = variant.bulk_pricing.price_per_item;
+        }
+        const totalHarga = quantity * hargaPerPcs;
+
+        const orderDetails = { productId, variantSlug, productName: product.name, variantName: variant.name, quantity, reservedItems };
+        const customerInfo = { telegramUserId: ctx.from.id.toString(), first_name: ctx.from.first_name };
+
+        const rawPayment = await pakasir.createTransaction(internalOrderId, totalHarga);
+        console.log("[PAKASIR] Raw payment response:", JSON.stringify(rawPayment, null, 2));
+
+        const payment = {
+            displayOrderId: rawPayment.displayOrderId,   // = internalOrderId
+            realOrderId: rawPayment.realOrderId,
+            qrString: rawPayment.qrString,
+            amount: rawPayment.amount,                   // nominal dasar (dikirim ke Pakasir)
+            totalBayar: rawPayment.totalBayar,           // yang dibayar customer
+            fee: rawPayment.fee,
+        };
+
+        if (!payment.qrString) throw new Error("QR String tidak ditemukan dari response Pakasir");
+
+        const newOrder = new Order({
+            orderId: payment.displayOrderId,
+            realOrderId: payment.realOrderId,
+            internalRefId: internalOrderId,
+            depositId: payment.realOrderId,
+            amount: totalHarga,           // nominal dasar -> dipakai polling & statistik
+            status: "PENDING",
+            expiresAt: junkOrderExpiry(),
+            ...orderDetails,
+            customerInfo,
+            paymentGateway: "pakasir",
+        });
+        await newOrder.save({ session });
+        await session.commitTransaction();
+        transactionCommitted = true;
+
+        const qrDataURL = await QRCode.toDataURL(payment.qrString, {
+            type: 'image/png', width: 512, margin: 2, errorCorrectionLevel: 'M',
+            color: { dark: '#000000', light: '#FFFFFF' }
+        });
+        const qrBuffer = Buffer.from(qrDataURL.split(",")[1], "base64");
+
+        const caption = `📁 *Invoice Berhasil Dibuat*\n\`\`\`\n${payment.displayOrderId}\n\`\`\`\n────────────✧\n*QRIS SEMUA PEMBAYARAN*\n────────────✧\n*Informasi Item:*\n— Nama: ${product.name.toUpperCase()} - ${variant.name}\n— Jumlah: ${quantity}x\n\n*Informasi Pembayaran:*\n— ID Transaksi: \`${payment.displayOrderId}\`\n— Total Dibayar: Rp ${Number(payment.totalBayar).toLocaleString('id-ID')}\n— Kedaluwarsa dalam: 5 Menit`;
+        const keyboard = Markup.inlineKeyboard([[Markup.button.callback('Batalkan Pembelian', `cancel_payment_pakasir_${payment.displayOrderId}`)]]);
+
+        await ctx.deleteMessage().catch(() => {});
+        qrPhotoMsg = await ctx.replyWithPhoto({ source: qrBuffer }, { caption, parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+
+        // ===== KONFIRMASI VIA POLLING (tiap 5 detik, maks 5 menit) =====
+        const pollInterval = 5000;
+        const pollDuration = 300000; // 5 menit
+        let isHandled = false;
+        const startedAt = Date.now();
+
+        const finish = async () => {
+            const s = paymentSessions.get(payment.displayOrderId);
+            if (s) {
+                clearInterval(s.pollingId);
+                clearTimeout(s.timeoutId);
+                paymentSessions.delete(payment.displayOrderId);
+            }
+        };
+
+        const handleExpiry = async () => {
+            if (isHandled) return;
+            isHandled = true;
+            await finish();
+            const expired = await Order.findOneAndUpdate(
+                { orderId: payment.displayOrderId, status: 'PENDING' },
+                { $set: { status: 'EXPIRED' } }
+            );
+            if (!expired) return; // sudah dibayar / diproses
+            await Product.updateOne(
+                { id: productId, "variants.slug": variantSlug },
+                { $push: { "variants.$.stock": { $each: reservedItems } }, $pull: { "variants.$.reserved_stock": { $in: reservedItems } } }
+            );
+            await bot.telegram.deleteMessage(ctx.chat.id, qrPhotoMsg.message_id).catch(() => {});
+            await bot.telegram.sendMessage(ctx.from.id, `📜 *Tagihan Kadaluarsa*\n\nTagihan untuk ID \`${payment.displayOrderId}\` telah kadaluarsa.`, { parse_mode: 'Markdown' }).catch(() => {});
+        };
+
+        const pollOnce = async () => {
+            if (isHandled) return;
+            if (Date.now() - startedAt > pollDuration) { await handleExpiry(); return; }
+            try {
+                const res = await pakasir.checkPaymentStatus(payment.displayOrderId, totalHarga);
+                const status = String(res?.transaction?.status || '').toLowerCase();
+                if (status === 'completed') {
+                    if (isHandled) return;
+                    isHandled = true;
+                    await finish();
+                    await fulfillPakasirPaidOrder(payment.displayOrderId);
+                }
+            } catch (e) {
+                console.error('[PAKASIR] poll error:', e.message);
+            }
+        };
+
+        const pollingId = setInterval(pollOnce, pollInterval);
+        const timeoutId = setTimeout(handleExpiry, pollDuration);
+        paymentSessions.set(payment.displayOrderId, {
+            pollingId, timeoutId,
+            qrPhotoMsgId: qrPhotoMsg.message_id,
+            chatId: ctx.chat.id,
+            userId: ctx.from.id,
+        });
+
+    } catch (error) {
+        console.error('[PAKASIR] Error in action:', error);
+        if (!transactionCommitted) {
+            await session.abortTransaction();
+        } else {
+            await handlePaymentCreationError(productId, variantSlug, reservedItems, internalOrderId);
+        }
+        if (workingMsg) await ctx.deleteMessage(workingMsg.message_id).catch(() => {});
+        await ctx.reply('❌ Maaf, terjadi kesalahan internal saat membuat invoice. Silakan coba lagi nanti.');
+        const ownerId = process.env.OWNER_ID;
+        if (ownerId) {
+            const detail = (error && error.message) ? error.message : String(error);
+            await bot.telegram.sendMessage(ownerId, `⚠️ [DEBUG PAKASIR] Gagal membuat invoice:\n${detail}`).catch(() => {});
+        }
+    } finally {
+        session.endSession();
     }
 });
 
-// Handler pembatalan pembayaran QRIN (QRIS ALL). Didaftarkan sebelum handler generic.
-bot.action(/^cancel_payment_qrin_(.*)$/, async (ctx) => {
+// ===== Pemenuhan order Pakasir yang sudah dibayar (dipanggil polling / webhook) =====
+async function fulfillPakasirPaidOrder(orderId) {
+    // Idempoten: hanya proses order yang MASIH PENDING (aman thd double polling+webhook).
+    const order = await Order.findOneAndUpdate(
+        { orderId: orderId, status: 'PENDING' },
+        { $set: { status: 'PAID', paidAt: new Date() }, $unset: { expiresAt: "" } },
+        { new: true }
+    );
+    if (!order) {
+        const existing = await Order.findOne({ orderId: orderId }).lean();
+        if (existing && existing.status === 'PAID') return { ok: false, reason: 'already_paid' };
+        return { ok: false, reason: 'not_pending' };
+    }
+
+    const sess = paymentSessions.get(orderId);
+    if (sess) {
+        clearInterval(sess.pollingId);
+        clearTimeout(sess.timeoutId);
+        paymentSessions.delete(orderId);
+        if (sess.chatId && sess.qrPhotoMsgId) {
+            await bot.telegram.deleteMessage(sess.chatId, sess.qrPhotoMsgId).catch(() => {});
+        }
+    }
+
+    await Product.updateOne(
+        { id: order.productId, "variants.slug": order.variantSlug },
+        { $pull: { "variants.$.reserved_stock": { $in: order.reservedItems } } }
+    );
+    await User.updateOne({ id: order.customerInfo.telegramUserId }, { $inc: { totalSpent: order.amount } });
+
+    // Kirim akun via helper tahan-banting (fallback teks biasa + lapor owner bila gagal).
+    await deliverAccountsToCustomer(order, 'QRIS');
+    return { ok: true };
+}
+
+// =================================================================
+// REKONSILIASI SAAT STARTUP (Pakasir)
+// Menutup celah: kalau bot restart SETELAH customer bayar tapi SEBELUM
+// polling sempat melihat "completed", order tetap PENDING dan timer
+// polling-nya hilang. Saat bot menyala lagi, fungsi ini mengecek ulang
+// status semua order Pakasir yang masih PENDING langsung ke Pakasir; yang
+// sudah dibayar langsung dipenuhi (fulfillPakasirPaidOrder bersifat idempoten).
+// =================================================================
+async function reconcilePakasirPendingOrders() {
+    try {
+        // Cek order PENDING pakasir dalam 24 jam terakhir (invoice cuma 5 menit,
+        // tapi longgar supaya pembayaran yang telat/terlewat saat bot mati tetap tertangani).
+        const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        const pendings = await Order.find({
+            status: 'PENDING',
+            paymentGateway: 'pakasir',
+            createdAt: { $gte: since },
+        }).lean();
+
+        if (pendings.length === 0) return;
+        console.log(`[RECONCILE] Cek ulang ${pendings.length} order Pakasir PENDING...`);
+
+        let fulfilled = 0;
+        for (const o of pendings) {
+            try {
+                const res = await pakasir.checkPaymentStatus(o.orderId, o.amount);
+                const status = String(res?.transaction?.status || '').toLowerCase();
+                if (status === 'completed') {
+                    const r = await fulfillPakasirPaidOrder(o.orderId);
+                    if (r && r.ok) {
+                        fulfilled += 1;
+                        console.log(`[RECONCILE] Order ${o.orderId} ternyata sudah dibayar -> dipenuhi.`);
+                    }
+                }
+            } catch (e) {
+                console.error(`[RECONCILE] gagal cek ${o.orderId}:`, e.message);
+            }
+            // jeda kecil supaya tidak membombardir API Pakasir
+            await new Promise((r) => setTimeout(r, 500));
+        }
+        if (fulfilled > 0) {
+            console.log(`[RECONCILE] Selesai: ${fulfilled} order dipenuhi setelah restart.`);
+        }
+    } catch (error) {
+        console.error('[RECONCILE] Error:', error.message);
+    }
+}
+
+// Handler pembatalan Pakasir. WAJIB didaftarkan SEBELUM handler generic
+// cancel_payment_(.*) agar pola cancel_payment_pakasir_... tidak salah tangkap.
+bot.action(/^cancel_payment_pakasir_(.*)$/, async (ctx) => {
     try {
         await ctx.answerCbQuery();
         const orderId = ctx.match[1];
         const paymentSession = paymentSessions.get(orderId);
         if (paymentSession) {
+            clearInterval(paymentSession.pollingId);
             clearTimeout(paymentSession.timeoutId);
             paymentSessions.delete(orderId);
             await ctx.deleteMessage(paymentSession.qrPhotoMsgId).catch(() => {});
@@ -2230,14 +2152,107 @@ bot.action(/^cancel_payment_qrin_(.*)$/, async (ctx) => {
             await ctx.reply('❌ Pesanan QRIS Anda telah berhasil dibatalkan.');
         } catch (dbError) {
             await session.abortTransaction();
-            console.error('Database error during QRIN cancellation:', dbError);
+            console.error('Database error during Pakasir cancellation:', dbError);
             await ctx.reply('❌ Terjadi kesalahan internal saat membatalkan pesanan.');
         } finally {
             session.endSession();
         }
     } catch (error) {
-        console.error('Error in cancel_payment_qrin:', error);
+        console.error('Error in cancel_payment_pakasir:', error);
         await ctx.reply('❌ Terjadi kesalahan saat memproses pembatalan.');
+    }
+});
+
+// ===== Webhook / Callback QRIN =====
+// Daftarkan salah satu URL ini di Setting Merchant QRIN:
+//   https://DOMAIN-ANDA/callback   ATAU   https://DOMAIN-ANDA/qrin/callback
+// (kedua path ditangani agar cocok dengan apa pun yang Anda isi di dashboard).
+// Tanda tangan: header X-Callback-Signature = HMAC-SHA256(raw body, QRIN_TOKEN).
+// Health check publik (tanpa login) untuk Render + keep-alive pinger
+// (mis. UptimeRobot ping tiap ~10 menit agar Render Free tidak tidur).
+app.get(['/health', '/ping'], (req, res) => res.status(200).send('OK'));
+
+// Menangani DUA gateway pada satu route:
+//  - PAKASIR : POST tanpa signature, body { order_id, status:"completed", amount, ... }
+//              -> ini yang dipakai sekarang. URL webhook di dashboard Pakasir:
+//                 https://fzistore.my.id/callback  (atau /pakasir/callback).
+//              CATATAN: webhook Pakasir OPSIONAL — bot sudah polling status sendiri,
+//              jadi pembayaran tetap terkonfirmasi walau webhook tidak diset.
+//  - QRIN    : POST dengan header X-Callback-Signature, body { no_ref_merchant, status:"success" }
+//              (dipertahankan agar kompatibel; sudah tidak dipakai lagi).
+app.post(['/callback', '/qrin/callback', '/pakasir/callback'], async (req, res) => {
+    try {
+        const body = req.body || {};
+        const signature = req.headers['x-callback-signature'];
+        // Pakasir tidak mengirim signature dan memakai field order_id (bukan no_ref_merchant).
+        const isPakasir = req.path.includes('pakasir')
+            || (!signature && !body.no_ref_merchant && (body.order_id || body.status));
+
+        // ---------------- PAKASIR (tanpa tanda tangan) ----------------
+        if (isPakasir) {
+            const orderId = body.order_id;
+            const status = String(body.status || '').toLowerCase();
+            console.log(`[PAKASIR CALLBACK] order=${orderId} status=${status}`);
+            if (!orderId) return res.status(400).json({ success: false, message: 'order_id missing' });
+
+            if (status === 'completed') {
+                // Karena Pakasir tidak pakai signature, verifikasi ulang status ke
+                // endpoint transactiondetail (sesuai anjuran dokumentasi) sebelum
+                // memenuhi order — mencegah callback palsu.
+                let verified = true;
+                try {
+                    const detail = await pakasir.checkPaymentStatus(orderId, body.amount);
+                    verified = String(detail?.transaction?.status || '').toLowerCase() === 'completed';
+                } catch (e) {
+                    console.error('[PAKASIR CALLBACK] verify error:', e.message);
+                    verified = false;
+                }
+
+                if (verified) {
+                    const result = await fulfillPakasirPaidOrder(orderId);
+                    if (!result.ok && result.reason === 'not_pending') {
+                        const ownerId = process.env.OWNER_ID;
+                        if (ownerId) {
+                            await bot.telegram.sendMessage(ownerId, `⚠️ [PAKASIR] Pembayaran diterima untuk order \`${orderId}\` tetapi status order bukan PENDING (mungkin sudah kadaluarsa). Perlu cek manual.`, { parse_mode: 'Markdown' }).catch(() => {});
+                        }
+                    }
+                } else {
+                    console.warn(`[PAKASIR CALLBACK] status "completed" TIDAK terverifikasi utk order ${orderId} — diabaikan.`);
+                }
+            }
+            // Pakasir cukup menerima 200.
+            return res.json({ success: true });
+        }
+
+        // ---------------- QRIN (dengan tanda tangan) ----------------
+        const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body || {}), 'utf8');
+        if (!qrin.verifyCallbackSignature(rawBody, signature)) {
+            console.warn('[QRIN CALLBACK] Signature tidak valid');
+            return res.status(401).json({ success: false, message: 'Invalid signature' });
+        }
+
+        const orderId = body.no_ref_merchant;
+        const status = String(body.status || '').toLowerCase();
+        console.log(`[QRIN CALLBACK] order=${orderId} status=${status}`);
+
+        if (!orderId) return res.status(400).json({ success: false, message: 'no_ref_merchant missing' });
+
+        if (status === 'success') {
+            const result = await fulfillQrinPaidOrder(orderId);
+            if (!result.ok && result.reason === 'not_pending') {
+                const ownerId = process.env.OWNER_ID;
+                if (ownerId) {
+                    await bot.telegram.sendMessage(ownerId, `⚠️ [QRIN] Pembayaran diterima untuk order \`${orderId}\` tetapi status order bukan PENDING (mungkin sudah kadaluarsa). Perlu cek manual.`, { parse_mode: 'Markdown' }).catch(() => {});
+                }
+            }
+        } else if (status === 'expired' || status === 'failed') {
+            console.log(`[QRIN CALLBACK] order ${orderId} -> ${status}`);
+        }
+
+        return res.json({ success: true });
+    } catch (e) {
+        console.error('[CALLBACK] Error:', e);
+        return res.status(500).json({ success: false, message: 'internal error' });
     }
 });
 
@@ -2328,6 +2343,49 @@ bot.action(/^cancel_payment_dana_(.*)$/, async (ctx) => {
 });
 
 // [KODE ASLI DIKEMBALIKAN] Handler terpisah untuk membatalkan pembayaran Linkqu (QRIS umum)
+// Handler pembatalan pembayaran QRIN (QRIS ALL). Session & orderId di-key
+// berdasarkan displayOrderId. Didaftarkan SEBELUM handler generic di bawah agar
+// pola `cancel_payment_qrin_...` tidak keliru ditangkap regex generic.
+bot.action(/^cancel_payment_qrin_(.*)$/, async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        const orderId = ctx.match[1];
+        const paymentSession = paymentSessions.get(orderId);
+        if (paymentSession) {
+            clearTimeout(paymentSession.timeoutId);
+            paymentSessions.delete(orderId);
+            await ctx.deleteMessage(paymentSession.qrPhotoMsgId).catch(() => {});
+        } else {
+            await ctx.deleteMessage().catch(() => {});
+        }
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        try {
+            const order = await Order.findOneAndUpdate({ orderId: orderId, status: 'PENDING' }, { $set: { status: 'CANCELLED', cancelledAt: new Date() } }, { new: true, session: session });
+            if (!order) {
+                await ctx.reply('Pesanan tidak ditemukan atau sudah diproses.');
+                await session.abortTransaction();
+                session.endSession();
+                return;
+            }
+            if (order.reservedItems && order.reservedItems.length > 0) {
+                await Product.updateOne({ id: order.productId, "variants.slug": order.variantSlug }, { $push: { "variants.$.stock": { $each: order.reservedItems } }, $pull: { "variants.$.reserved_stock": { $in: order.reservedItems } } }).session(session);
+            }
+            await session.commitTransaction();
+            await ctx.reply('❌ Pesanan QRIS Anda telah berhasil dibatalkan.');
+        } catch (dbError) {
+            await session.abortTransaction();
+            console.error('Database error during QRIN cancellation:', dbError);
+            await ctx.reply('❌ Terjadi kesalahan internal saat membatalkan pesanan.');
+        } finally {
+            session.endSession();
+        }
+    } catch (error) {
+        console.error('Error in cancel_payment_qrin:', error);
+        await ctx.reply('❌ Terjadi kesalahan saat memproses pembatalan.');
+    }
+});
+
 bot.action(/^cancel_payment_(.*)$/, async (ctx) => {
     try {
         await ctx.answerCbQuery();
@@ -2527,39 +2585,29 @@ bot.hears(/^[^\/]/, async (ctx) => {
     if (!userState) return;
     
     try {
-        if (userState.state === 'awaiting_custom_qty') {
-            const { productId, variantSlug, page } = userState;
-            let qty = parseInt(String(ctx.message.text).replace(/\D/g, ''), 10);
+        if (userState.state === 'awaiting_variant_price') {
+            // Admin mengetik harga baru untuk varian.
+            const done = await adminModule.handleVariantPriceInput(ctx, userState);
+            if (done) delete userStates[userId];
+            return;
 
-            // Ambil stok terkini (mungkin berubah sejak tombol ditekan)
-            const { variant } = await findProductAndVariant(productId, variantSlug);
-            const maxStock = variant ? variant.stock.length : 0;
+        } else if (userState.state === 'awaiting_variant_name') {
+            // Admin mengetik nama baru untuk varian.
+            const done = await adminModule.handleVariantNameInput(ctx, userState);
+            if (done) delete userStates[userId];
+            return;
 
-            if (!variant || maxStock === 0) {
-                delete userStates[userId];
-                return ctx.reply('❌ Maaf, stok varian ini sudah habis. Silakan pilih produk lain.');
-            }
-            if (isNaN(qty) || qty < 1) {
-                return ctx.reply(`❌ Jumlah tidak valid. Ketik angka antara 1 - ${maxStock}.`);
-            }
-            if (qty > maxStock) {
-                return ctx.reply(`⚠️ Stok hanya tersisa ${maxStock}. Ketik angka antara 1 - ${maxStock}.`);
-            }
-
-            delete userStates[userId];
-            const { message, keyboard } = await generateQuantityMessageAndKeyboard(productId, variantSlug, qty, page);
-            await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+        } else if (userState.state === 'awaiting_take_stock_count') {
+            // Admin mengetik jumlah akun yang mau diambil.
+            const done = await adminModule.handleTakeStockCount(ctx, userState);
+            if (done) delete userStates[userId];
+            return;
 
         } else if (userState.state === 'awaiting_stock') {
             const stockToAdd = ctx.message.text.split('\n').filter(line => line.trim() !== '');
             await adminModule.addStock(userState.productId, userState.variantSlug, stockToAdd, ctx);
             delete userStates[userId];
-
-        } else if (userState.state === 'awaiting_take_stock_count') {
-            const jumlah = parseInt(String(ctx.message.text).replace(/\D/g, ''), 10);
-            await adminModule.takeStock(userState.productId, userState.variantSlug, jumlah, ctx);
-            delete userStates[userId];
-
+            
         } else if (userState.state === 'edit_product_name_desc') {
             const parts = ctx.message.text.split('|').map(p => p.trim());
             if (parts.length !== 2) {
@@ -2622,37 +2670,50 @@ bot.hears(/^[^\/]/, async (ctx) => {
             const message = ctx.message.text;
             delete userStates[userId];
 
-            const statusMessage = await ctx.reply('⏳ Menyiapkan broadcast...');
+            const statusMessage = await ctx.reply('Mengirim broadcast...');
+            const allUsers = await User.find({}, 'id').lean();
+            const userIds = allUsers.map(user => user.id);
 
-            // Helper edit status yang TIDAK PERNAH melempar error. Inilah bug
-            // lamanya: edit status gagal (biasanya 429 setelah kirim massal),
-            // errornya naik ke catch besar, dan admin melihat
-            // "Terjadi kesalahan" padahal broadcast-nya sukses terkirim.
-            const updateStatus = async (text) => {
+            let successCount = 0;
+            let failCount = 0;
+
+            // Lampirkan tombol inline (Lihat Produk / Cek Stok / Riwayat) di bawah
+            // pesan broadcast, sama seperti /start.
+            const promoExtra = { parse_mode: 'Markdown', reply_markup: getPromoInlineKeyboard().reply_markup };
+            for (const id of userIds) {
                 try {
-                    await ctx.telegram.editMessageText(
-                        ctx.chat.id, statusMessage.message_id, null, text,
-                        { parse_mode: 'Markdown' }
-                    );
-                } catch (editError) {
-                    const info = telegramErrorInfo(editError);
-                    if (!info.description.includes('message is not modified')) {
-                        console.error('Broadcast: gagal update status:', info.description);
-                    }
+                    await ctx.telegram.sendMessage(id, message, promoExtra);
+                    successCount++;
+                } catch (e) {
+                    failCount++;
                 }
-            };
+            }
 
-            const result = await runBroadcast(ctx.telegram, {
-                text: message,
-                attachStock: true,
-                onProgress: (done, running) => updateStatus(
-                    `⏳ *Mengirim broadcast...*\n\n` +
-                    `Terkirim: ${running.success} / ${running.total}`
-                )
-            });
+            // Laporan hasil broadcast. Kegagalan meng-edit/mengirim laporan status
+            // (mis. Telegram menolak edit) TIDAK boleh dianggap broadcast gagal —
+            // dulu error di sini naik ke catch luar dan memunculkan notif
+            // "Terjadi kesalahan" walau pengiriman sebenarnya berhasil.
+            const summaryText =
+                `🚀 *Broadcast Selesai*\n\n` +
+                `✅ Berhasil terkirim: ${successCount} pengguna\n` +
+                `❌ Gagal terkirim: ${failCount} pengguna`;
+            try {
+                await ctx.telegram.editMessageText(
+                    ctx.chat.id,
+                    statusMessage.message_id,
+                    null,
+                    summaryText,
+                    { parse_mode: 'Markdown' }
+                );
+            } catch (editErr) {
+                console.error('Broadcast: gagal edit pesan status (diabaikan):', editErr.message);
+                // Fallback: kirim laporan sebagai pesan baru, tanpa Markdown agar aman.
+                await ctx.reply(
+                    `🚀 Broadcast Selesai\n\n✅ Berhasil terkirim: ${successCount} pengguna\n❌ Gagal terkirim: ${failCount} pengguna`
+                ).catch(() => {});
+            }
+            return;
 
-            await updateStatus(formatBroadcastSummary(result));
-            
         } else if (userState.state === 'awaiting_snk') {
             const newSnk = ctx.message.text;
             
@@ -3021,9 +3082,36 @@ bot.hears(/^[^\/]/, async (ctx) => {
 });
 
 bot.catch((err, ctx) => {
-    console.error(`Error for user ${ctx.from?.id}:`, err);
+    // Selalu catat detail asli ke log/console (ini yang berguna utk diagnosa).
+    const desc = String((err && (err.description || err.message)) || err || '');
+    console.error(`[bot.catch] type=${ctx && ctx.updateType} user=${ctx && ctx.from && ctx.from.id}: ${desc}`);
+
+    // Error Telegram berikut BUKAN kegagalan nyata (mis. menekan tombol lama,
+    // edit pesan yang isinya sama, pesan sudah dihapus, atau user memblokir bot).
+    // Untuk kasus ini JANGAN tampilkan pesan error yang menakutkan ke user —
+    // cukup diabaikan. Inilah penyebab popup "kesalahan internal" yang salah-alarm.
+    const benign = [
+        'message is not modified',
+        'query is too old',
+        'query ID is invalid',
+        'message to edit not found',
+        'message to delete not found',
+        "message can't be deleted",
+        'MESSAGE_ID_INVALID',
+        'message to be replied not found',
+        'bot was blocked by the user',
+        'user is deactivated',
+        'chat not found',
+        'Forbidden',
+        "can't parse entities", // pesan Markdown tidak valid -> sudah ditangani di handler masing2
+    ];
+    if (benign.some(s => desc.includes(s))) return;
+
+    // Sisanya baru dianggap error nyata & diberitahukan ke user (jika memungkinkan).
     try {
-        ctx.reply('❌ Maaf, terjadi kesalahan internal. Silakan coba lagi nanti.');
+        if (ctx && typeof ctx.reply === 'function') {
+            ctx.reply('❌ Maaf, terjadi kesalahan internal. Silakan coba lagi nanti.').catch(() => {});
+        }
     } catch (e) {
         console.error("Fatal error: Can't send error message to user.", e);
     }
@@ -3039,27 +3127,48 @@ bot.command('refund', async (ctx) => {
     await ctx.reply(message, { parse_mode: 'Markdown' });
 });
 
-// ===== Perintah OWNER: cek akun DigitalOcean, preview, & pemulihan kirim =====
+// Trigger manual pengecekan akun DigitalOcean (khusus owner).
 bot.command('cekdo', async (ctx) => {
     const ADMIN_IDS = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
-    if (!ADMIN_IDS.includes(String(ctx.from.id))) return;
-    await ctx.reply('🔍 Memulai pengecekan akun DigitalOcean di stok...');
+    if (!ADMIN_IDS.includes(String(ctx.from.id))) {
+        return; // abaikan bila bukan owner
+    }
+    await ctx.reply('🔍 Memulai pengecekan akun DigitalOcean di stok... (hasil dikirim setelah selesai)');
     try {
         const result = await docheck.runDigitalOceanCheck(bot);
-        if (result && result.skipped) await ctx.reply('⏳ Pengecekan lain sedang berjalan.');
-        else if (result && typeof result.checked === 'number') await ctx.reply(`✅ Selesai.\nDicek: ${result.checked}\nLocked (dihapus): ${result.removed}\nInvalid: ${result.invalid}`);
-        else await ctx.reply('✅ Pengecekan selesai.');
-    } catch (err) { await ctx.reply(`❌ Gagal: ${err.message}`); }
+        if (result && result.skipped) {
+            await ctx.reply('⏳ Pengecekan lain sedang berjalan. Coba lagi nanti.');
+        } else if (result && typeof result.checked === 'number') {
+            await ctx.reply(
+                `✅ Selesai.\nDicek: ${result.checked}\nLocked (dihapus): ${result.removed}\nInvalid: ${result.invalid}`
+            );
+        } else {
+            await ctx.reply('✅ Pengecekan selesai.');
+        }
+    } catch (err) {
+        await ctx.reply(`❌ Gagal: ${err.message}`);
+    }
 });
 
+// Preview tampilan akun ke customer TANPA harus membeli (khusus owner).
+//   /preview                -> ambil 1 stok DigitalOcean pertama & tampilkan
+//   /preview dop_v1x|a|b|c   -> tampilkan format dari teks yang diketik
 bot.command('preview', async (ctx) => {
     const ADMIN_IDS = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
-    if (!ADMIN_IDS.includes(String(ctx.from.id))) return;
-    const raw = ctx.message.text.replace(/^\/preview(@\w+)?\s*/i, '').trim();
-    if (raw) {
-        const formatted = formatItemsForCustomer([raw]);
-        return ctx.reply(`👁️ *Preview Tampilan ke Customer*\n\n` + "```\n" + `PRODUK\n${formatted}` + "\n```", { parse_mode: 'Markdown' });
+    if (!ADMIN_IDS.includes(String(ctx.from.id))) {
+        return; // abaikan bila bukan owner
     }
+
+    const raw = ctx.message.text.replace(/^\/preview(@\w+)?\s*/i, '').trim();
+
+    if (raw) {
+        // Preview dari teks yang diketik owner.
+        const formatted = formatItemsForCustomer([raw]);
+        const msg = `👁️ *Preview Tampilan ke Customer*\n\n` + "```\n" + `${'PRODUK'}\n${formatted}` + "\n```";
+        return ctx.reply(msg, { parse_mode: 'Markdown' });
+    }
+
+    // Tanpa argumen: ambil stok pertama yang tersedia (produk apa pun).
     try {
         const products = await Product.find().lean();
         for (const product of products) {
@@ -3067,43 +3176,60 @@ bot.command('preview', async (ctx) => {
                 const stock = variant.stock || [];
                 if (stock.length > 0) {
                     const formatted = formatItemsForCustomer([stock[0]]);
-                    return ctx.reply(`👁️ *Preview Tampilan ke Customer*\n(${product.name} - ${variant.name})\n\n` + "```\n" + `${product.name.toUpperCase()}\n${formatted}` + "\n```", { parse_mode: 'Markdown' });
+                    const msg = `👁️ *Preview Tampilan ke Customer*\n(${product.name} - ${variant.name})\n\n` +
+                        "```\n" + `${product.name.toUpperCase()}\n${formatted}` + "\n```";
+                    return ctx.reply(msg, { parse_mode: 'Markdown' });
                 }
             }
         }
-        return ctx.reply('Tidak ada stok. Coba: `/preview id|password|note|note`', { parse_mode: 'Markdown' });
-    } catch (err) { return ctx.reply(`❌ Gagal: ${err.message}`); }
+        return ctx.reply('Tidak ada stok yang ditemukan. Coba ketik contohnya: `/preview id|password|note|note`', { parse_mode: 'Markdown' });
+    } catch (err) {
+        return ctx.reply(`❌ Gagal: ${err.message}`);
+    }
 });
 
+// Daftar order yang SUDAH DIBAYAR tapi akun BELUM terkirim (khusus owner).
 bot.command('belumkirim', async (ctx) => {
     const ADMIN_IDS = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
     if (!ADMIN_IDS.includes(String(ctx.from.id))) return;
     try {
-        const orders = await Order.find({ status: 'PAID', delivered: { $ne: true } }).sort({ paidAt: -1 }).limit(30).lean();
-        if (orders.length === 0) return ctx.reply('✅ Tidak ada order yang belum terkirim.');
+        const orders = await Order.find({ status: 'PAID', delivered: { $ne: true } })
+            .sort({ paidAt: -1 }).limit(30).lean();
+        if (orders.length === 0) {
+            return ctx.reply('✅ Tidak ada order yang belum terkirim. Semua akun sudah sampai ke customer.');
+        }
         const lines = [`⚠️ *${orders.length} order sudah dibayar tapi akun belum terkirim:*`, ''];
         orders.forEach((o, i) => {
             const when = o.paidAt ? moment(o.paidAt).tz('Asia/Jakarta').format('DD/MM HH:mm') : '-';
             lines.push(`${i + 1}. \`${o.orderId}\`\n   ${o.productName} - ${o.variantName} (${o.quantity}x) • user ${o.customerInfo?.telegramUserId} • ${when}`);
         });
-        lines.push('', 'Kirim ulang: `/resend <ID_ORDER>`');
+        lines.push('', 'Kirim ulang dengan: `/resend <ID_ORDER>`');
         await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
-    } catch (err) { await ctx.reply(`❌ Gagal: ${err.message}`); }
+    } catch (err) {
+        await ctx.reply(`❌ Gagal: ${err.message}`);
+    }
 });
 
+// Kirim ulang akun ke customer untuk order tertentu (khusus owner).
 bot.command('resend', async (ctx) => {
     const ADMIN_IDS = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
     if (!ADMIN_IDS.includes(String(ctx.from.id))) return;
     const orderId = ctx.message.text.replace(/^\/resend(@\w+)?\s*/i, '').trim();
-    if (!orderId) return ctx.reply('Format: `/resend <ID_ORDER>`', { parse_mode: 'Markdown' });
+    if (!orderId) {
+        return ctx.reply('Format: `/resend <ID_ORDER>`\nLihat daftar dengan /belumkirim', { parse_mode: 'Markdown' });
+    }
     try {
         const order = await Order.findOne({ orderId }).lean();
         if (!order) return ctx.reply('❌ Order tidak ditemukan.');
-        if (order.status !== 'PAID') return ctx.reply(`❌ Status order = ${order.status} (bukan PAID).`);
-        if (!order.reservedItems || order.reservedItems.length === 0) return ctx.reply('❌ Data akun order ini sudah kosong (lewat masa retensi).');
+        if (order.status !== 'PAID') return ctx.reply(`❌ Status order \`${orderId}\` = ${order.status} (bukan PAID), tidak dikirim.`, { parse_mode: 'Markdown' });
+        if (!order.reservedItems || order.reservedItems.length === 0) {
+            return ctx.reply('❌ Data akun order ini sudah kosong (kemungkinan sudah lewat masa retensi). Tidak bisa dikirim ulang otomatis.');
+        }
         const ok = await deliverAccountsToCustomer(order, (order.paymentGateway || 'QRIS').toUpperCase());
-        await ctx.reply(ok ? `✅ Akun order \`${orderId}\` berhasil dikirim ulang.` : `❌ Masih gagal kirim untuk \`${orderId}\`. Cek apakah bot diblokir user.`, { parse_mode: 'Markdown' });
-    } catch (err) { await ctx.reply(`❌ Gagal: ${err.message}`); }
+        await ctx.reply(ok ? `✅ Akun order \`${orderId}\` berhasil dikirim ulang ke customer.` : `❌ Masih gagal kirim ke customer untuk \`${orderId}\`. Cek apakah bot diblokir user.`, { parse_mode: 'Markdown' });
+    } catch (err) {
+        await ctx.reply(`❌ Gagal: ${err.message}`);
+    }
 });
 
 // =================================================================
@@ -3137,22 +3263,32 @@ bot.launch().then(() => {
 setTimeout(runStorageMaintenance, 30 * 1000);
 setInterval(runStorageMaintenance, MAINTENANCE_INTERVAL_HOURS * 60 * 60 * 1000);
 
-// Pengecekan akun DigitalOcean di stok: 60 detik setelah start, lalu tiap 1 jam.
-// Akun locked otomatis dihapus dari stok & dilaporkan ke OWNER_ID.
+// Rekonsiliasi order Pakasir yang mungkin dibayar saat bot mati (ditunda 20 detik
+// agar koneksi DB siap). Menutup celah "sudah bayar tapi bot restart".
+setTimeout(reconcilePakasirPendingOrders, 20 * 1000);
+
+// Pengecekan akun DigitalOcean di stok: sekali saat start (ditunda 60 detik
+// agar koneksi DB & bot siap), lalu berkala (default tiap 1 jam). Akun yang
+// berstatus locked otomatis dihapus dari stok dan dilaporkan ke OWNER_ID.
 setTimeout(() => docheck.runDigitalOceanCheck(bot), 60 * 1000);
 setInterval(() => docheck.runDigitalOceanCheck(bot), docheck.CHECK_INTERVAL_MS);
 
-// Jaring pengaman: error tak tertangkap tidak mematikan seluruh bot, cukup dilaporkan.
+// Jaring pengaman: jangan biarkan error tak tertangkap mematikan seluruh bot
+// (mis. error di dalam polling/timer). Cukup dicatat + dilaporkan ke owner.
 process.on('unhandledRejection', (reason) => {
     console.error('[UNHANDLED REJECTION]', reason);
     const owners = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
     const msg = (reason && reason.message) ? reason.message : String(reason);
-    for (const o of owners) bot.telegram.sendMessage(o, `⚠️ [BOT] Unhandled rejection:\n${msg}`).catch(() => {});
+    for (const o of owners) {
+        bot.telegram.sendMessage(o, `⚠️ [BOT] Unhandled rejection:\n${msg}`).catch(() => {});
+    }
 });
 process.on('uncaughtException', (err) => {
     console.error('[UNCAUGHT EXCEPTION]', err);
     const owners = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
-    for (const o of owners) bot.telegram.sendMessage(o, `⚠️ [BOT] Uncaught exception:\n${err.message}`).catch(() => {});
+    for (const o of owners) {
+        bot.telegram.sendMessage(o, `⚠️ [BOT] Uncaught exception:\n${err.message}`).catch(() => {});
+    }
 });
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
