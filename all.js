@@ -232,6 +232,41 @@ async function markOrderDelivered(orderId) {
     }
 }
 
+// Notifikasi ke OWNER tiap ada order yang berhasil dibayar:
+// berisi User ID pembeli, produk, jumlah, dan harga. Dikirim ke DM owner
+// (OWNER_ID), terpisah dari notifikasi grup (GROUP_NOTIF_ID).
+async function notifyOwnerNewOrder(order) {
+    const owners = ownerIdList();
+    if (owners.length === 0) return;
+
+    let waktu;
+    try {
+        waktu = moment(order.paidAt || new Date()).tz('Asia/Jakarta').format('HH:mm DD/MM/YY');
+    } catch (e) {
+        waktu = new Date().toISOString();
+    }
+
+    const nama = order.customerInfo?.first_name ? ` (${order.customerInfo.first_name})` : '';
+    const msg = [
+        '🛒 *Order Baru — Sudah Dibayar*',
+        `👤 User ID: \`${order.customerInfo?.telegramUserId || '-'}\`${nama}`,
+        `📦 Produk: ${order.productName || '-'}${order.variantName ? ' - ' + order.variantName : ''}`,
+        `🔢 Jumlah: ${order.quantity || 1}x`,
+        `💰 Harga: Rp ${Number(order.amount || 0).toLocaleString('id-ID')}`,
+        `💳 Metode: ${(order.paymentGateway || '-').toUpperCase()}`,
+        `🧾 Order ID: \`${order.orderId}\``,
+        `🕒 ${waktu}`,
+    ].join('\n');
+
+    for (const ownerId of owners) {
+        try {
+            await bot.telegram.sendMessage(ownerId, msg, { parse_mode: 'Markdown' });
+        } catch (e) {
+            console.error(`[ORDER-NOTIF] gagal kirim ke owner ${ownerId}:`, e.message);
+        }
+    }
+}
+
 async function alertOwnerDeliveryFailed(order, reason) {
     const owners = ownerIdList();
     if (owners.length === 0) return;
@@ -309,8 +344,11 @@ async function deliverAccountsToCustomer(order, methodLabel) {
             );
         }
 
+        const wasFirstDelivery = !order.delivered;
         await markOrderDelivered(order.orderId);
         if (GROUP_NOTIF_ID) await sendAdminNotification(bot, order).catch(() => {});
+        // Notif owner hanya saat pengiriman PERTAMA (bukan saat /resend).
+        if (wasFirstDelivery) await notifyOwnerNewOrder(order).catch(() => {});
         return true;
     } catch (err) {
         console.error(`[DELIVERY] GAGAL kirim akun order ${order.orderId}:`, err.message);
