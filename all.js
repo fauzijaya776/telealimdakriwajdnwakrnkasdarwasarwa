@@ -22,6 +22,7 @@ const { connectDB, User, Product, Order, Settings, slimPaymentDetails } = requir
 const dana = require('./qris_dana');
 const tokopay = require('./qris_tokopay');
 const qrin = require('./qris_qrin');
+const pakasir = require('./qris_pakasir');
 const linkqu = require('./qris_linkqu');
 const adminModule = require('./admin');
 const QRCode = require('qrcode');
@@ -2043,7 +2044,10 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
     const productId = ctx.match[1];
     const variantSlug = ctx.match[2];
     const quantity = parseInt(ctx.match[3]);
-    const internalOrderId = `G-${ctx.from.id}-${Date.now()}`;
+    // Prefix ALIM- = PENANDA order milik tokotelealim. Bila memakai akun Pakasir
+    // yang sama dengan tokoteledompet, bot tokoteledompet mengenali prefix ini dan
+    // MENGABAIKAN callback-nya (tidak diproses sebagai order sendiri).
+    const internalOrderId = `ALIM-${ctx.from.id}-${Date.now()}`;
     let reservedItems = [];
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -2074,32 +2078,33 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         const orderDetails = { productId, variantSlug, productName: product.name, variantName: variant.name, quantity, reservedItems };
         const customerInfo = { telegramUserId: ctx.from.id.toString(), first_name: ctx.from.first_name };
 
-        const rawPayment = await qrin.createTransaction(internalOrderId, totalHarga, product.name);
-        console.log("[QRIN] Raw payment response:", JSON.stringify(rawPayment, null, 2));
+        const rawPayment = await pakasir.createTransaction(internalOrderId, totalHarga);
+        console.log("[PAKASIR] Raw payment response:", JSON.stringify(rawPayment, null, 2));
 
         const payment = {
-            displayOrderId: rawPayment.displayOrderId,
+            displayOrderId: rawPayment.displayOrderId,   // = internalOrderId (ALIM-...)
             realOrderId: rawPayment.realOrderId,
+            txnId: rawPayment.txnId,                     // v2: WAJIB utk cek status (polling)
             qrString: rawPayment.qrString,
-            amount: rawPayment.amount,
-            totalBayar: rawPayment.totalBayar,
+            amount: rawPayment.amount,                   // nominal dasar (diterima merchant)
+            totalBayar: rawPayment.totalBayar,           // dibayar customer (sudah + fee)
             fee: rawPayment.fee,
-            validity: rawPayment.validity,
         };
 
-        if (!payment.qrString) throw new Error("QR String tidak ditemukan dari response QRIN");
+        if (!payment.qrString) throw new Error("QR String tidak ditemukan dari response Pakasir");
 
         const newOrder = new Order({
             orderId: payment.displayOrderId,
             realOrderId: payment.realOrderId,
+            pakasirTxnId: payment.txnId,
             internalRefId: internalOrderId,
             depositId: payment.realOrderId,
-            amount: payment.amount,
+            amount: totalHarga,
             status: "PENDING",
             expiresAt: junkOrderExpiry(),
             ...orderDetails,
             customerInfo,
-            paymentGateway: "qrin",
+            paymentGateway: "pakasir",
         });
         await newOrder.save({ session });
         await session.commitTransaction();
@@ -2114,31 +2119,37 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         });
         const qrBuffer = Buffer.from(qrDataURL.split(",")[1], "base64");
 
-        const caption = `📁 *Invoice Berhasil Dibuat*\n\`\`\`\n${payment.displayOrderId}\n\`\`\`\n────────────✧\n*QRIS SEMUA PEMBAYARAN*\n────────────✧\n*Informasi Item:*\n— Nama: ${product.name.toUpperCase()} - ${variant.name}\n— Jumlah: ${quantity}x\n\n*Informasi Pembayaran:*\n— ID Transaksi: \`${payment.displayOrderId}\`\n— Total Dibayar: Rp ${payment.totalBayar.toLocaleString('id-ID')}\n— Kedaluwarsa dalam: 5 Menit`;
-        const keyboard = Markup.inlineKeyboard([[Markup.button.callback('Batalkan Pembelian', `cancel_payment_qrin_${payment.displayOrderId}`)]]);
+        const caption = `📁 *Invoice Berhasil Dibuat*\n\`\`\`\n${payment.displayOrderId}\n\`\`\`\n────────────✧\n*QRIS SEMUA PEMBAYARAN*\n────────────✧\n*Informasi Item:*\n— Nama: ${product.name.toUpperCase()} - ${variant.name}\n— Jumlah: ${quantity}x\n\n*Informasi Pembayaran:*\n— ID Transaksi: \`${payment.displayOrderId}\`\n— Harga: Rp ${Number(payment.amount).toLocaleString('id-ID')}\n— Biaya QRIS: Rp ${Number(payment.fee).toLocaleString('id-ID')}\n— Total Dibayar: Rp ${Number(payment.totalBayar).toLocaleString('id-ID')}\n— Kedaluwarsa dalam: 5 Menit`;
+        const keyboard = Markup.inlineKeyboard([[Markup.button.callback('Batalkan Pembelian', `cancel_payment_pakasir_${payment.displayOrderId}`)]]);
 
         await ctx.deleteMessage().catch(() => {});
         qrPhotoMsg = await ctx.replyWithPhoto({ source: qrBuffer }, { caption, parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
 
-        // ===== MODE WEBHOOK (QRIN tidak menyediakan endpoint polling) =====
-        // Konfirmasi pembayaran datang dari QRIN via POST /callback -> fulfillQrinPaidOrder().
-        const pollDuration = 300000; // 5 menit, selaras dengan validity QRIN
+        // ===== KONFIRMASI VIA POLLING (Pakasir v2 punya endpoint cek status) =====
+        // Mandiri — tidak bergantung webhook. Cek status tiap 5 detik, maks 5 menit.
+        const pollInterval = 5000;
+        const pollDuration = 300000; // 5 menit
         let isHandled = false;
+        const startedAt = Date.now();
+
+        const finish = async () => {
+            const s = paymentSessions.get(payment.displayOrderId);
+            if (s) {
+                clearInterval(s.pollingId);
+                clearTimeout(s.timeoutId);
+                paymentSessions.delete(payment.displayOrderId);
+            }
+        };
 
         const handleExpiry = async () => {
             if (isHandled) return;
             isHandled = true;
-            const sessionData = paymentSessions.get(payment.displayOrderId);
-            if (sessionData) {
-                clearTimeout(sessionData.timeoutId);
-                paymentSessions.delete(payment.displayOrderId);
-            }
-
+            await finish();
             const expired = await Order.findOneAndUpdate(
                 { orderId: payment.displayOrderId, status: 'PENDING' },
                 { $set: { status: 'EXPIRED' } }
             );
-            if (!expired) return; // sudah dibayar / diproses callback
+            if (!expired) return; // sudah dibayar / diproses
 
             await Product.updateOne(
                 { id: productId, "variants.slug": variantSlug },
@@ -2152,16 +2163,34 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
             await bot.telegram.sendMessage(ctx.from.id, `📜 *Tagihan Kadaluarsa*\n\nTagihan untuk ID \`${payment.displayOrderId}\` telah kadaluarsa.`, { parse_mode: 'Markdown' }).catch(() => {});
         };
 
+        const pollOnce = async () => {
+            if (isHandled) return;
+            if (Date.now() - startedAt > pollDuration) { await handleExpiry(); return; }
+            try {
+                const res = await pakasir.checkPaymentStatus(payment.txnId);
+                const status = String(res?.status || '').toLowerCase();
+                if (status === 'completed') {
+                    if (isHandled) return;
+                    isHandled = true;
+                    await finish();
+                    await fulfillPakasirPaidOrder(payment.displayOrderId);
+                }
+            } catch (e) {
+                console.error('[PAKASIR] poll error:', e.message);
+            }
+        };
+
+        const pollingId = setInterval(pollOnce, pollInterval);
         const timeoutId = setTimeout(handleExpiry, pollDuration);
         paymentSessions.set(payment.displayOrderId, {
-            timeoutId,
+            pollingId, timeoutId,
             qrPhotoMsgId: qrPhotoMsg.message_id,
             chatId: ctx.chat.id,
             userId: ctx.from.id,
         });
 
     } catch (error) {
-        console.error('[QRIN] Error in action:', error);
+        console.error('[PAKASIR] Error in action:', error);
 
         if (!transactionCommitted) {
             await session.abortTransaction();
@@ -2177,7 +2206,114 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
     }
 });
 
-// ===== Pemenuhan order yang sudah dibayar (dipanggil oleh webhook QRIN) =====
+// ===== Pemenuhan order Pakasir yang sudah dibayar (dipanggil polling / reconcile) =====
+async function fulfillPakasirPaidOrder(orderId) {
+    const order = await Order.findOneAndUpdate(
+        { orderId: orderId, status: 'PENDING' },
+        { $set: { status: 'PAID', paidAt: new Date() }, $unset: { expiresAt: "" } },
+        { new: true }
+    );
+    if (!order) {
+        const existing = await Order.findOne({ orderId: orderId }).lean();
+        if (existing && existing.status === 'PAID') return { ok: false, reason: 'already_paid' };
+        return { ok: false, reason: 'not_pending' };
+    }
+
+    const sess = paymentSessions.get(orderId);
+    if (sess) {
+        clearInterval(sess.pollingId);
+        clearTimeout(sess.timeoutId);
+        paymentSessions.delete(orderId);
+        if (sess.chatId && sess.qrPhotoMsgId) {
+            await bot.telegram.deleteMessage(sess.chatId, sess.qrPhotoMsgId).catch(() => {});
+        }
+    }
+
+    await Product.updateOne(
+        { id: order.productId, "variants.slug": order.variantSlug },
+        { $pull: { "variants.$.reserved_stock": { $in: order.reservedItems } } }
+    );
+    await User.updateOne({ id: order.customerInfo.telegramUserId }, { $inc: { totalSpent: order.amount } });
+
+    await deliverAccountsToCustomer(order, 'QRIS');
+    return { ok: true };
+}
+
+// Rekonsiliasi saat startup: kalau bot mati SETELAH customer bayar tapi SEBELUM
+// polling melihat "completed", cek ulang order Pakasir PENDING langsung ke Pakasir.
+async function reconcilePakasirPendingOrders() {
+    try {
+        const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        const pendings = await Order.find({
+            status: 'PENDING',
+            paymentGateway: 'pakasir',
+            createdAt: { $gte: since },
+        }).lean();
+        if (pendings.length === 0) return;
+        console.log(`[RECONCILE] Cek ulang ${pendings.length} order Pakasir PENDING...`);
+        let fulfilled = 0;
+        for (const o of pendings) {
+            try {
+                const res = await pakasir.checkPaymentStatus(o.pakasirTxnId);
+                const status = String(res?.status || '').toLowerCase();
+                if (status === 'completed') {
+                    const r = await fulfillPakasirPaidOrder(o.orderId);
+                    if (r && r.ok) { fulfilled += 1; console.log(`[RECONCILE] Order ${o.orderId} dipenuhi.`); }
+                }
+            } catch (e) {
+                console.error(`[RECONCILE] gagal cek ${o.orderId}:`, e.message);
+            }
+            await new Promise((r) => setTimeout(r, 500));
+        }
+        if (fulfilled > 0) console.log(`[RECONCILE] Selesai: ${fulfilled} order dipenuhi setelah restart.`);
+    } catch (error) {
+        console.error('[RECONCILE] Error:', error.message);
+    }
+}
+
+// Handler pembatalan pembayaran Pakasir (QRIS ALL). Didaftarkan sebelum handler generic.
+bot.action(/^cancel_payment_pakasir_(.*)$/, async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        const orderId = ctx.match[1];
+        const paymentSession = paymentSessions.get(orderId);
+        if (paymentSession) {
+            clearInterval(paymentSession.pollingId);
+            clearTimeout(paymentSession.timeoutId);
+            paymentSessions.delete(orderId);
+            await ctx.deleteMessage(paymentSession.qrPhotoMsgId).catch(() => {});
+        } else {
+            await ctx.deleteMessage().catch(() => {});
+        }
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        try {
+            const order = await Order.findOneAndUpdate({ orderId: orderId, status: 'PENDING' }, { $set: { status: 'CANCELLED', cancelledAt: new Date() } }, { new: true, session: session });
+            if (!order) {
+                await ctx.reply('Pesanan tidak ditemukan atau sudah diproses.');
+                await session.abortTransaction();
+                session.endSession();
+                return;
+            }
+            if (order.reservedItems && order.reservedItems.length > 0) {
+                await Product.updateOne({ id: order.productId, "variants.slug": order.variantSlug }, { $push: { "variants.$.stock": { $each: order.reservedItems } }, $pull: { "variants.$.reserved_stock": { $in: order.reservedItems } } }).session(session);
+            }
+            await session.commitTransaction();
+            await ctx.reply('❌ Pesanan QRIS Anda telah berhasil dibatalkan.');
+        } catch (dbError) {
+            await session.abortTransaction();
+            console.error('Database error during Pakasir cancellation:', dbError);
+            await ctx.reply('❌ Terjadi kesalahan internal saat membatalkan pesanan.');
+        } finally {
+            session.endSession();
+        }
+    } catch (error) {
+        console.error('Error in cancel_payment_pakasir:', error);
+        await ctx.reply('❌ Terjadi kesalahan saat memproses pembatalan.');
+    }
+});
+
+// ===== Pemenuhan order yang sudah dibayar (dipanggil oleh webhook QRIN — legacy) =====
 async function fulfillQrinPaidOrder(orderId) {
     const order = await Order.findOneAndUpdate(
         { orderId: orderId, status: 'PENDING' },
@@ -3186,6 +3322,9 @@ setInterval(runStorageMaintenance, MAINTENANCE_INTERVAL_HOURS * 60 * 60 * 1000);
 // Akun locked otomatis dihapus dari stok & dilaporkan ke OWNER_ID.
 setTimeout(() => docheck.runDigitalOceanCheck(bot), 60 * 1000);
 setInterval(() => docheck.runDigitalOceanCheck(bot), docheck.CHECK_INTERVAL_MS);
+
+// Rekonsiliasi order Pakasir yang mungkin dibayar saat bot mati (ditunda 20 detik).
+setTimeout(reconcilePakasirPendingOrders, 20 * 1000);
 
 // Jaring pengaman: error tak tertangkap tidak mematikan seluruh bot, cukup dilaporkan.
 process.on('unhandledRejection', (reason) => {
