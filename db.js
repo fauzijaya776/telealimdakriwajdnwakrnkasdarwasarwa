@@ -53,6 +53,9 @@ const OrderSchema = new mongoose.Schema({
     // Pakasir API v2: txn_id transaksi. Dipakai untuk cek status (polling) & rekonsiliasi.
     pakasirTxnId: String,
     amount: Number,
+    // Rincian bayar (dipakai struk testimoni): biaya QRIS & total yang dibayar customer.
+    fee: Number,
+    totalPaid: Number,
     status: { type: String, enum: ['PENDING', 'PAID', 'CANCELLED', 'EXPIRED', 'FAILED'], default: 'PENDING' },
     // Penanda apakah akun sudah BENAR-BENAR terkirim ke customer.
     // status PAID = uang masuk; delivered = akun sampai ke pembeli.

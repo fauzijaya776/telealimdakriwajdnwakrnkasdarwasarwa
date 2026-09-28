@@ -1,0 +1,12 @@
+# Dependensi — dipasang ulang otomatis oleh Render lewat "npm install"
+node_modules/
+
+# RAHASIA — jangan pernah di-commit ke GitHub
+.env
+env
+env-1
+*.env
+
+# File kerja lokal
+Claude outputs/
+*.rar
