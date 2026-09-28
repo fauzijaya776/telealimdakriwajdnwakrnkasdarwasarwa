@@ -2,7 +2,8 @@ const {
   Markup
 } = require('telegraf');
 const {
-  Product
+  Product,
+  Settings
 } = require('./db');
 const {
   createTransfer,
@@ -73,7 +74,18 @@ async function deleteProduct(productId) {
   });
 }
 
+// Status mode senyap testimoni channel (default ON bila belum pernah diatur).
+async function getTestiSilent() {
+  try {
+    const s = await Settings.findOne({ identifier: 'global-settings' }).lean();
+    return s && typeof s.testi_silent === 'boolean' ? s.testi_silent : true;
+  } catch (e) {
+    return true;
+  }
+}
+
 async function getAdminMenuMessageAndKeyboard() {
+  const testiSilent = await getTestiSilent();
   const message = '⚙️ *Panel Admin*\n\n' +
   'Silakan pilih opsi manajemen:';
 
@@ -89,6 +101,7 @@ async function getAdminMenuMessageAndKeyboard() {
     [Markup.button.callback('🚀 Broadcast', 'admin_broadcast')],
     [Markup.button.callback('💳 Buat Transfer', 'admin_tf')],
     [Markup.button.callback('🧾 Cek Saldo', 'admin_profile')],
+    [Markup.button.callback(testiSilent ? '🔕 Testimoni Senyap: ON' : '🔔 Testimoni Senyap: OFF', 'admin_testi_silent')],
     [Markup.button.callback('⬅️ Kembali ke Menu Utama', 'back_to_start')]
   ]);
 
@@ -504,6 +517,22 @@ module.exports = (bot) => {
     await ctx.editMessageText(message, {
       parse_mode: 'Markdown', reply_markup: keyboard.reply_markup
     });
+  });
+
+  // Nyala/matikan mode senyap testimoni channel (tanpa bunyi untuk subscriber).
+  bot.action('admin_testi_silent', adminMiddleware, async (ctx) => {
+    try {
+      const next = !(await getTestiSilent());
+      await Settings.updateOne({ identifier: 'global-settings' }, { $set: { testi_silent: next } }, { upsert: true });
+      await ctx.answerCbQuery(next
+        ? '🔕 Mode senyap AKTIF: testimoni berikutnya dikirim tanpa bunyi.'
+        : '🔔 Mode senyap MATI: testimoni berikutnya dikirim dengan bunyi notifikasi.', { show_alert: true }).catch(() => {});
+      const { message, keyboard } = await getAdminMenuMessageAndKeyboard();
+      await ctx.editMessageText(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }).catch(() => {});
+    } catch (err) {
+      console.error('[TESTI] gagal mengubah mode senyap:', err);
+      await ctx.answerCbQuery('❌ Gagal mengubah mode senyap.').catch(() => {});
+    }
   });
 
   bot.action('admin_broadcast', adminMiddleware, async (ctx) => {

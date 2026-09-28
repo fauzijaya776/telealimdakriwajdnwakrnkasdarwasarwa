@@ -19,6 +19,25 @@ const fs = require('fs');
 // pemilihan tebal/tipis (bold) dilakukan oleh Skia dari metadata font itu sendiri.
 const FONT_FAMILY = 'Liberation Sans';
 const FONT = `"${FONT_FAMILY}"`;
+// Tombol di bawah setiap testimoni untuk SUBSCRIBER. Bot tidak bisa mematikan notifikasi
+// channel untuk orang tertentu (batasan Telegram), jadi tombol menampilkan cara mematikannya.
+const MUTE_CALLBACK = 'testi_mute_info';
+const MUTE_BUTTON_TEXT = '🔕 Matikan notifikasi';
+// Batas popup Telegram: 200 karakter (dihitung UTF-16) — teks ini 193, jangan diperpanjang.
+const MUTE_HOWTO = '🔕 Cara mematikan notifikasi channel ini:\n\n' +
+    'Ketuk "Senyapkan" / "Mute" di bagian paling bawah channel.\n\n' +
+    'Atau: ketuk nama channel → Notifikasi → Matikan.\n\n' +
+    'Testimoni tetap bisa dilihat kapan saja.';
+
+// Antrean testimoni (tercatat di dokumen Order, tahan restart):
+const SEND_TRIES = 4;                  // percobaan kirim per sekali proses
+const BACKOFF_MS = [3000, 10000, 20000]; // jeda antar percobaan (error jaringan / server)
+const LOCK_MS = 3 * 60 * 1000;         // kunci anti-dobel saat sebuah testimoni sedang dikirim
+const MAX_ATTEMPTS = 6;                // batas total percobaan (termasuk sapuan ulang)
+const SWEEP_EVERY_MS = 10 * 60 * 1000; // sapu ulang testimoni yang belum terposting
+const SWEEP_WINDOW_H = 48;             // hanya order yang antre dalam 48 jam terakhir
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 const W = 1000;          // lebar logis gambar
 const SCALE = 1.5;       // hasil PNG = 1500 px
 const PAD = 36;          // jarak kartu ke tepi gambar
@@ -124,7 +143,7 @@ function buildCaption(d, brand, botUsername) {
         '🧾 <b>STRUK PEMBELIAN — LUNAS</b> ✅',
         L,
         `👤 <b>ID Pembeli</b> : ${escHtml(d.buyer)}`,
-        `📦 <b>Produk</b> : ${escHtml(d.productFull)}`,
+        `📦 <b>Produk</b> : ${escHtml(d.productFull.length > 200 ? d.productFull.slice(0, 197) + '…' : d.productFull)}`,
         `💳 <b>Metode Bayar</b> : ${escHtml(d.method)}`,
         `📅 <b>Tanggal</b> : ${escHtml(d.date)}`,
         '',
@@ -137,9 +156,9 @@ function buildCaption(d, brand, botUsername) {
     lines.push(botUsername
         ? `🛒 Order otomatis 24 jam di <a href="https://t.me/${botUsername}">${store}</a>`
         : `🛒 Order otomatis 24 jam di ${store}`);
-    let cap = lines.join('\n');
-    if (cap.length > 1024) cap = cap.slice(0, 1020) + '…'; // batas caption Telegram
-    return cap;
+    // Nama produk sudah dibatasi 200 huruf, jadi caption selalu < 1024 (batas Telegram)
+    // tanpa perlu memotong teks HTML (memotong HTML bisa merusak tag -> posting gagal).
+    return lines.join('\n');
 }
 
 // ------------------------------------------------------------------ gambar (Canvas 2D standar)
@@ -452,7 +471,6 @@ function createTestimoni(cfg) {
     let initPromise = null;      // inisialisasi SEKALI (aman bila 2 order lunas bersamaan)
     let canvasMod = null;
     let logoImg = null;
-    let warnedPost = false;
     let botUsername = null;
 
     function channel() {
@@ -505,6 +523,29 @@ function createTestimoni(cfg) {
         return typeof canvas.encode === 'function' ? await canvas.encode('png') : canvas.toBuffer('image/png');
     }
 
+    // Mode senyap (default ON): testimoni dikirim tanpa bunyi agar subscriber tidak terganggu.
+    async function isSilent() {
+        if (typeof cfg.isSilent !== 'function') return true;
+        try {
+            return Boolean(await cfg.isSilent());
+        } catch (e) {
+            return true;
+        }
+    }
+
+    function muteKeyboard() {
+        return { inline_keyboard: [[{ text: MUTE_BUTTON_TEXT, callback_data: MUTE_CALLBACK }]] };
+    }
+
+    // Daftarkan handler tombol. Panggil SEBELUM middleware lain (lihat all.js) supaya
+    // subscriber channel yang menekan tombol tidak ikut tercatat sebagai user bot.
+    function attach(bot) {
+        bot.action(MUTE_CALLBACK, async (ctx) => {
+            await ctx.answerCbQuery(MUTE_HOWTO, { show_alert: true }).catch(() => {});
+        });
+        startSweeper(bot); // coba ulang otomatis testimoni yang belum terposting
+    }
+
     async function getBotUsername(bot) {
         if (botUsername) return botUsername;
         try {
@@ -515,40 +556,195 @@ function createTestimoni(cfg) {
         return botUsername;
     }
 
-    // Dipanggil sekali per order (saat akun PERTAMA kali terkirim). Tidak pernah melempar error.
-    async function post(bot, order, methodLabel) {
+    function methodFromOrder(o) {
+        return String(o.paymentGateway || '').toLowerCase() === 'dana' ? 'DANA' : 'QRIS';
+    }
+
+    function errInfo(e) {
+        const code = (e && (e.code || (e.response && e.response.error_code))) || null;
+        const desc = (e && (e.description || (e.response && e.response.description) || e.message)) || String(e);
+        const params = (e && (e.parameters || (e.response && e.response.parameters))) || {};
+        return { code: typeof code === 'number' ? code : null, desc: String(desc), retryAfter: Number(params.retry_after) || 0 };
+    }
+
+    // Kirim 1 testimoni dengan coba ulang. Tidak pernah melempar error.
+    async function sendWithRetry(bot, order, methodLabel) {
         const ch = channel();
-        if (!ch || !order) return { posted: false, reason: 'nonaktif' };
+        if (!ch) return { posted: false, reason: 'nonaktif', permanent: true };
+        let d;
+        let caption;
         try {
-            const d = buildReceiptData(order, methodLabel, brand);
-            const caption = buildCaption(d, brand, await getBotUsername(bot));
-            let png = null;
-            try {
-                png = await renderPng(d);
-            } catch (e) {
-                console.error('[TESTI] render gambar gagal, kirim teks saja:', e.message);
-            }
-            if (png) {
-                await bot.telegram.sendPhoto(ch, { source: png, filename: `testimoni-${d.trxTail}.png` }, { caption, parse_mode: 'HTML' });
-            } else {
-                await bot.telegram.sendMessage(ch, caption, { parse_mode: 'HTML', disable_web_page_preview: true });
-            }
-            console.log(`[TESTI] ${d.trx} diposting ke ${ch}${png ? '' : ' (teks)'}`);
-            return { posted: true, image: Boolean(png) };
+            d = buildReceiptData(order, methodLabel || methodFromOrder(order), brand);
+            caption = buildCaption(d, brand, await getBotUsername(bot));
         } catch (e) {
-            const msg = (e && (e.description || e.message)) || String(e);
-            console.error(`[TESTI] gagal posting ke ${ch}:`, msg);
-            if (!warnedPost && typeof cfg.notifyOwner === 'function') {
-                warnedPost = true; // cukup sekali per nyala bot, agar tidak spam
-                Promise.resolve(cfg.notifyOwner(
-                    `⚠️ Testimoni gagal diposting ke ${ch}\nSebab: ${msg}\n\nPastikan bot sudah jadi ADMIN di channel tersebut dengan izin "Post Messages".`
-                )).catch(() => {});
+            return { posted: false, reason: 'data order tidak valid: ' + e.message, permanent: true };
+        }
+        let png = null;
+        try {
+            png = await renderPng(d);
+        } catch (e) {
+            console.error('[TESTI] render gambar gagal, kirim teks saja:', e.message);
+        }
+        const silent = await isSilent();
+        let useHtml = true;
+        let last = null;
+        for (let i = 0; i < SEND_TRIES; i++) {
+            try {
+                const text = useHtml ? caption : caption.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+                const extra = { disable_notification: silent, reply_markup: muteKeyboard() };
+                if (useHtml) extra.parse_mode = 'HTML';
+                if (png) {
+                    await bot.telegram.sendPhoto(ch, { source: png, filename: `testimoni-${d.trxTail}.png` }, { caption: text, ...extra });
+                } else {
+                    await bot.telegram.sendMessage(ch, text, { disable_web_page_preview: true, ...extra });
+                }
+                console.log(`[TESTI] ${d.trx} diposting ke ${ch}${png ? '' : ' (teks)'}${silent ? ' [senyap]' : ''}${i ? ` (percobaan ke-${i + 1})` : ''}`);
+                return { posted: true, image: Boolean(png), silent };
+            } catch (e) {
+                last = errInfo(e);
+                console.warn(`[TESTI] ${d.trx} gagal (percobaan ${i + 1}/${SEND_TRIES}): ${last.desc}`);
+                if (last.code === 403 || /chat not found|not enough rights|not a member|bot was kicked/i.test(last.desc)) {
+                    return { posted: false, reason: last.desc, permanent: true }; // bot belum admin/izin kurang
+                }
+                if (last.code === 400) {
+                    if (useHtml && /parse entities|can't parse|unsupported start tag/i.test(last.desc)) {
+                        useHtml = false;          // caption bermasalah -> kirim teks polos
+                        continue;
+                    }
+                    if (png) {
+                        png = null;               // gambar ditolak -> kirim sebagai teks
+                        continue;
+                    }
+                    return { posted: false, reason: last.desc, permanent: true };
+                }
+                if (i < SEND_TRIES - 1) {
+                    // 429 = dibatasi Telegram: tunggu sesuai retry_after. Lainnya (jaringan/5xx): jeda bertahap.
+                    const wait = last.code === 429 ? Math.min((last.retryAfter || 5) * 1000 + 500, 65000) : BACKOFF_MS[Math.min(i, BACKOFF_MS.length - 1)];
+                    await sleep(wait);
+                }
             }
-            return { posted: false, reason: msg };
+        }
+        return { posted: false, reason: last ? last.desc : 'tidak diketahui', permanent: false };
+    }
+
+    let lastOwnerAlert = 0;
+    function alertOwner(text) {
+        if (typeof cfg.notifyOwner !== 'function') return;
+        if (Date.now() - lastOwnerAlert < 30 * 60 * 1000) return; // maks. 1 peringatan / 30 menit
+        lastOwnerAlert = Date.now();
+        Promise.resolve(cfg.notifyOwner(text)).catch(() => {});
+    }
+
+    // Satu percobaan posting untuk order tertentu, dengan kunci anti-dobel di database.
+    async function attempt(bot, orderId, methodLabel) {
+        const Order = cfg.Order;
+        const now = new Date();
+        let order;
+        try {
+            order = await Order.findOneAndUpdate(
+                {
+                    orderId,
+                    testiPostedAt: null,
+                    $or: [{ testiLockUntil: null }, { testiLockUntil: { $lt: now } }],
+                },
+                { $set: { testiLockUntil: new Date(now.getTime() + LOCK_MS) }, $inc: { testiAttempts: 1 } },
+                { new: true }
+            ).lean();
+        } catch (e) {
+            console.error('[TESTI] gagal mengunci antrean:', e.message);
+            return { posted: false, reason: e.message };
+        }
+        if (!order) return { posted: false, reason: 'sudah diposting / sedang diproses' };
+
+        const res = await sendWithRetry(bot, order, methodLabel || order.testiMethod);
+        try {
+            if (res.posted) {
+                await Order.updateOne({ orderId }, { $set: { testiPostedAt: new Date() }, $unset: { testiLockUntil: '', testiLastError: '' } });
+            } else {
+                const upd = { $set: { testiLastError: String(res.reason).slice(0, 200) }, $unset: { testiLockUntil: '' } };
+                if (res.permanent) upd.$set.testiAttempts = MAX_ATTEMPTS; // jangan diulang lagi
+                await Order.updateOne({ orderId }, upd);
+            }
+        } catch (e) {
+            console.error('[TESTI] gagal menyimpan status antrean:', e.message);
+        }
+        if (!res.posted && res.reason !== 'nonaktif') {
+            const again = !res.permanent && (order.testiAttempts || 0) < MAX_ATTEMPTS;
+            alertOwner(
+                `⚠️ Testimoni order ${orderId} gagal diposting ke ${channel()}\nSebab: ${res.reason}\n\n` +
+                (again
+                    ? 'Akan dicoba ulang otomatis tiap 10 menit.'
+                    : 'Tidak akan dicoba ulang otomatis. Pastikan bot ADMIN channel dengan izin "Post Messages", lalu kirim ulang dengan /testiulang ' + orderId)
+            );
+        }
+        return res;
+    }
+
+    // Dipanggil sekali per order saat akun PERTAMA kali terkirim. Tidak pernah melempar error.
+    async function enqueue(bot, order, methodLabel) {
+        if (!channel() || !order) return { posted: false, reason: 'nonaktif' };
+        if (!cfg.Order) return sendWithRetry(bot, order, methodLabel); // tanpa database: kirim langsung
+        try {
+            // Tandai antre di database dulu -> kalau bot restart sebelum terkirim, sapuan akan mengirimnya.
+            await cfg.Order.updateOne(
+                { orderId: order.orderId, testiQueuedAt: null },
+                { $set: { testiQueuedAt: new Date(), testiMethod: methodLabel || methodFromOrder(order), testiAttempts: 0 } }
+            );
+        } catch (e) {
+            console.error('[TESTI] gagal mencatat antrean:', e.message);
+            return sendWithRetry(bot, order, methodLabel);
+        }
+        return attempt(bot, order.orderId, methodLabel);
+    }
+
+    // Kirim ulang manual oleh owner (mis. order lama sebelum fitur antrean ada).
+    async function repost(bot, orderId) {
+        if (!cfg.Order) return { posted: false, reason: 'database tidak tersedia' };
+        const o = await cfg.Order.findOne({ orderId }).lean();
+        if (!o) return { posted: false, reason: 'order tidak ditemukan' };
+        if (o.status !== 'PAID') return { posted: false, reason: `status order ${o.status}, bukan PAID` };
+        if (o.testiPostedAt) return { posted: false, reason: 'sudah pernah diposting', postedAt: o.testiPostedAt };
+        await cfg.Order.updateOne(
+            { orderId },
+            { $set: { testiQueuedAt: o.testiQueuedAt || new Date(), testiMethod: o.testiMethod || methodFromOrder(o), testiAttempts: 0 }, $unset: { testiLockUntil: '' } }
+        );
+        return attempt(bot, orderId);
+    }
+
+    // Sapu ulang testimoni yang belum terposting (gagal sementara / bot sempat restart).
+    let sweeping = false;
+    async function sweep(bot) {
+        if (sweeping || !cfg.Order || !channel()) return;
+        sweeping = true;
+        try {
+            const now = new Date();
+            const pending = await cfg.Order.find({
+                testiQueuedAt: { $gte: new Date(now.getTime() - SWEEP_WINDOW_H * 3600 * 1000) },
+                testiPostedAt: null,
+                testiAttempts: { $lt: MAX_ATTEMPTS },
+                $or: [{ testiLockUntil: null }, { testiLockUntil: { $lt: now } }],
+            }).sort({ testiQueuedAt: 1 }).limit(10).select('orderId testiMethod').lean();
+            for (const p of pending) {
+                await attempt(bot, p.orderId, p.testiMethod);
+                await sleep(4000); // jaga di bawah batas posting channel Telegram (20/menit)
+            }
+        } catch (e) {
+            console.error('[TESTI] sapuan gagal:', e.message);
+        } finally {
+            sweeping = false;
         }
     }
 
-    return { post, renderPng, buildReceiptData: (o, m) => buildReceiptData(o, m, brand), buildCaption: (d, u) => buildCaption(d, brand, u) };
+    function startSweeper(bot) {
+        if (!cfg.Order) return;
+        setTimeout(() => sweep(bot), 90 * 1000);
+        setInterval(() => sweep(bot), SWEEP_EVERY_MS);
+    }
+
+    // Kompatibel dengan pemanggilan lama.
+    const post = enqueue;
+
+    return { enqueue, post, repost, sweep, attach, renderPng, buildReceiptData: (o, m) => buildReceiptData(o, m, brand), buildCaption: (d, u) => buildCaption(d, brand, u) };
 }
 
 module.exports = createTestimoni;
@@ -563,3 +759,6 @@ module.exports.SCALE = SCALE;
 module.exports.FONT = FONT;
 module.exports.FONT_FAMILY = FONT_FAMILY;
 module.exports.cleanForImage = cleanForImage;
+module.exports.MUTE_CALLBACK = MUTE_CALLBACK;
+module.exports.MUTE_HOWTO = MUTE_HOWTO;
+module.exports.MAX_ATTEMPTS = MAX_ATTEMPTS;

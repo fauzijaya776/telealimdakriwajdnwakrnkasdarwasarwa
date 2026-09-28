@@ -56,6 +56,13 @@ const OrderSchema = new mongoose.Schema({
     // Rincian bayar (dipakai struk testimoni): biaya QRIS & total yang dibayar customer.
     fee: Number,
     totalPaid: Number,
+    // Antrean testimoni channel (tahan restart & coba ulang otomatis). Lihat testimoni.js.
+    testiQueuedAt: Date,    // kapan masuk antrean (akun pertama kali terkirim)
+    testiPostedAt: Date,    // kapan berhasil diposting ke channel
+    testiAttempts: Number,  // jumlah percobaan posting
+    testiLockUntil: Date,   // kunci anti-dobel saat sedang dikirim
+    testiMethod: String,    // label metode bayar untuk struk
+    testiLastError: String, // alasan gagal terakhir
     status: { type: String, enum: ['PENDING', 'PAID', 'CANCELLED', 'EXPIRED', 'FAILED'], default: 'PENDING' },
     // Penanda apakah akun sudah BENAR-BENAR terkirim ke customer.
     // status PAID = uang masuk; delivered = akun sampai ke pembeli.
@@ -84,6 +91,8 @@ const SettingsSchema = new mongoose.Schema({
     linkqu_enabled: { type: Boolean, default: true },
     dana_enabled: { type: Boolean, default: true },
     tokopay_enabled: { type: Boolean, default: true },
+    // Testimoni channel dikirim tanpa bunyi (default ON). Diubah lewat Admin Panel Telegram.
+    testi_silent: { type: Boolean, default: true },
 });
 
 // =============================================================
@@ -100,6 +109,9 @@ OrderSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0, name: 'ttl_expiresA
 
 // Dipakai fitur 'Riwayat Transaksi' (sebelumnya collection scan tiap ditekan).
 OrderSchema.index({ 'customerInfo.telegramUserId': 1, status: 1 });
+
+// Dipakai penyapu antrean testimoni (hanya order yang pernah masuk antrean).
+OrderSchema.index({ testiQueuedAt: 1 }, { sparse: true });
 
 const Settings = mongoose.model('Settings', SettingsSchema);
 const Product = mongoose.model('Product', ProductSchema);
