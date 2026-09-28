@@ -10,3 +10,4 @@ env-1
 # File kerja lokal
 Claude outputs/
 *.rar
+.upload-tmp/

@@ -20,6 +20,11 @@
 // =================================================================
 
 require('dotenv').config();
+
+// Escape karakter Markdown (format lama Telegram) pada teks dinamis seperti nama produk.
+function escMd(s) {
+    return String(s == null ? '' : s).replace(/([_*`\[])/g, '\\$1');
+}
 const axios = require('axios');
 const { Product } = require('./db');
 
@@ -104,7 +109,12 @@ async function notifyOwners(bot, text) {
         try {
             await bot.telegram.sendMessage(ownerId, text, { parse_mode: 'Markdown' });
         } catch (err) {
-            console.error(`[DO-CHECK] Gagal kirim ke owner ${ownerId}:`, err.message);
+            // Format rusak (nama produk berisi _ * dll) -> kirim ulang sebagai teks biasa.
+            try {
+                await bot.telegram.sendMessage(ownerId, text.replace(/\\([_*`\[])/g, '$1').replace(/[*`]/g, ''));
+            } catch (err2) {
+                console.error(`[DO-CHECK] Gagal kirim ke owner ${ownerId}:`, err2.message);
+            }
         }
     }
 }
@@ -196,9 +206,10 @@ async function runDigitalOceanCheck(bot) {
                 `Ditemukan *${removed.length}* akun berstatus *LOCKED* (mati) dan sudah *dihapus dari stok*:`,
                 '',
             ];
-            removed.forEach((r, i) => {
-                lines.push(`${i + 1}. ${r.product} — ${r.variant}\n   \`${maskToken(r.token)}\``);
+            removed.slice(0, 40).forEach((r, i) => {
+                lines.push(`${i + 1}. ${escMd(r.product)} — ${escMd(r.variant)}\n   \`${maskToken(r.token)}\``);
             });
+            if (removed.length > 40) lines.push(`… dan ${removed.length - 40} lainnya (lihat file terlampir)`);
             await notifyOwners(bot, lines.join('\n'));
 
             // Lampirkan detail lengkap akun yang dihapus (buat arsip owner).
@@ -220,9 +231,10 @@ async function runDigitalOceanCheck(bot) {
                 `Ada *${invalid.length}* akun yang tokennya *invalid/ditolak* (401). Tidak dihapus otomatis — silakan cek manual:`,
                 '',
             ];
-            invalid.forEach((r, i) => {
-                lines.push(`${i + 1}. ${r.product} — ${r.variant}\n   \`${maskToken(r.token)}\``);
+            invalid.slice(0, 40).forEach((r, i) => {
+                lines.push(`${i + 1}. ${escMd(r.product)} — ${escMd(r.variant)}\n   \`${maskToken(r.token)}\``);
             });
+            if (invalid.length > 40) lines.push(`… dan ${invalid.length - 40} lainnya`);
             await notifyOwners(bot, lines.join('\n'));
         }
 

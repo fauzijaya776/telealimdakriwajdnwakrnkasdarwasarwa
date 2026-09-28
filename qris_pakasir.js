@@ -65,6 +65,7 @@ async function createTransaction(internalOrderId, amount) {
         "X-Api-Key": api_key,
       },
       data: body,
+      timeout: 20000, // jangan menggantung selamanya kalau Pakasir lambat
     });
 
     // v2: response FLAT langsung di response.data (tanpa wrapper "payment").
@@ -75,6 +76,10 @@ async function createTransaction(internalOrderId, amount) {
       d.qr_string || d.qris_data || d.payment_number || d.qris || d.qrString || d.qr;
     if (!qrString) {
       throw new Error("Pakasir tidak mengembalikan QRIS (qr_string).");
+    }
+    // txn_id WAJIB: tanpa ini status pembayaran tidak bisa dicek sama sekali.
+    if (!d.txn_id) {
+      throw new Error("Pakasir tidak mengembalikan txn_id — invoice dibatalkan.");
     }
 
     return {
@@ -124,7 +129,7 @@ async function checkPaymentStatus(txnId) {
   try {
     const response = await axios.get(
       `${PAKASIR_BASE}/transaction-status/${encodeURIComponent(project)}/${encodeURIComponent(String(txnId))}`,
-      { headers: { "X-Api-Key": api_key } }
+      { headers: { "X-Api-Key": api_key }, timeout: 12000 }
     );
     return response.data; // flat
   } catch (error) {
@@ -172,7 +177,7 @@ async function getQrisFee(amount) {
   try {
     const nominal = parseInt(amount);
     if (isNaN(nominal) || nominal <= 0) return null;
-    const response = await axios.get(`${PAKASIR_BASE}/payment-fee/${nominal}`);
+    const response = await axios.get(`${PAKASIR_BASE}/payment-fee/${nominal}`, { timeout: 10000 });
     const d = response.data || {};
     return d.qris != null ? d.qris : null;
   } catch (error) {

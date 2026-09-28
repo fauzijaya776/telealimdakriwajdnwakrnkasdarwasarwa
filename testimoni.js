@@ -32,7 +32,7 @@ const MUTE_HOWTO = '🔕 Cara mematikan notifikasi channel ini:\n\n' +
 // Antrean testimoni (tercatat di dokumen Order, tahan restart):
 const SEND_TRIES = 4;                  // percobaan kirim per sekali proses
 const BACKOFF_MS = [3000, 10000, 20000]; // jeda antar percobaan (error jaringan / server)
-const LOCK_MS = 3 * 60 * 1000;         // kunci anti-dobel saat sebuah testimoni sedang dikirim
+const LOCK_MS = 10 * 60 * 1000;        // kunci anti-dobel (lebih lama dari waktu kirim terlama ±4 menit)
 const MAX_ATTEMPTS = 6;                // batas total percobaan (termasuk sapuan ulang)
 const SWEEP_EVERY_MS = 10 * 60 * 1000; // sapu ulang testimoni yang belum terposting
 const SWEEP_WINDOW_H = 48;             // hanya order yang antre dalam 48 jam terakhir
@@ -543,6 +543,21 @@ function createTestimoni(cfg) {
         bot.action(MUTE_CALLBACK, async (ctx) => {
             await ctx.answerCbQuery(MUTE_HOWTO, { show_alert: true }).catch(() => {});
         });
+        // /testigagal — daftar testimoni yang gagal permanen (khusus owner).
+        bot.command('testigagal', async (ctx) => {
+            const owners = (process.env.OWNER_ID || '').split(',').map((id) => id.trim()).filter(Boolean);
+            if (!owners.includes(String(ctx.from.id))) return;
+            if (!cfg.Order) return ctx.reply('Database tidak tersedia.');
+            const since = new Date(Date.now() - 7 * 24 * 3600 * 1000);
+            const rows = await cfg.Order.find({
+                testiQueuedAt: { $gte: since },
+                testiPostedAt: null,
+                testiAttempts: { $gte: MAX_ATTEMPTS },
+            }).sort({ testiQueuedAt: -1 }).limit(30).select('orderId testiLastError').lean().catch(() => []);
+            if (!rows.length) return ctx.reply('✅ Tidak ada testimoni yang gagal dalam 7 hari terakhir.');
+            const lines = rows.map((r, i) => `${i + 1}. ${r.orderId}\n   ${String(r.testiLastError || '-').slice(0, 80)}`);
+            return ctx.reply(`⚠️ Testimoni gagal (${rows.length}):\n\n${lines.join('\n')}\n\nKirim ulang: /testiulang <ID order>`);
+        });
         startSweeper(bot); // coba ulang otomatis testimoni yang belum terposting
     }
 
@@ -634,12 +649,32 @@ function createTestimoni(cfg) {
         lastOwnerAlert = Date.now();
         Promise.resolve(cfg.notifyOwner(text)).catch(() => {});
     }
+    // Gagal PERMANEN (tidak dicoba ulang) selalu dilaporkan — digabung per 1 menit supaya
+    // tidak spam, tapi tiap ID order tetap disebut.
+    const finalFails = [];
+    let finalTimer = null;
+    function alertFinal(orderId, reason) {
+        if (typeof cfg.notifyOwner !== 'function') return;
+        finalFails.push({ orderId, reason });
+        if (finalTimer) return;
+        finalTimer = setTimeout(() => {
+            finalTimer = null;
+            const items = finalFails.splice(0);
+            const shown = items.slice(0, 25).map((x) => `• ${x.orderId} — ${String(x.reason).slice(0, 80)}`);
+            if (items.length > 25) shown.push(`… dan ${items.length - 25} lainnya (/testigagal)`);
+            Promise.resolve(cfg.notifyOwner(
+                `⚠️ ${items.length} testimoni GAGAL diposting ke ${channel()} dan tidak dicoba ulang otomatis:\n\n${shown.join('\n')}\n\n` +
+                'Pastikan bot ADMIN channel dengan izin "Post Messages", lalu kirim ulang: /testiulang <ID order>. Daftar lengkap: /testigagal'
+            )).catch(() => {});
+        }, 60 * 1000);
+    }
 
     // Satu percobaan posting untuk order tertentu, dengan kunci anti-dobel di database.
     async function attempt(bot, orderId, methodLabel) {
         const Order = cfg.Order;
         const now = new Date();
         let order;
+        const lockUntil = new Date(now.getTime() + LOCK_MS); // sekaligus "token" pemilik kunci
         try {
             order = await Order.findOneAndUpdate(
                 {
@@ -647,7 +682,7 @@ function createTestimoni(cfg) {
                     testiPostedAt: null,
                     $or: [{ testiLockUntil: null }, { testiLockUntil: { $lt: now } }],
                 },
-                { $set: { testiLockUntil: new Date(now.getTime() + LOCK_MS) }, $inc: { testiAttempts: 1 } },
+                { $set: { testiLockUntil: lockUntil }, $inc: { testiAttempts: 1 } },
                 { new: true }
             ).lean();
         } catch (e) {
@@ -659,23 +694,24 @@ function createTestimoni(cfg) {
         const res = await sendWithRetry(bot, order, methodLabel || order.testiMethod);
         try {
             if (res.posted) {
+                // Tandai terposting apa pun kondisi kuncinya -> tidak akan diposting lagi.
                 await Order.updateOne({ orderId }, { $set: { testiPostedAt: new Date() }, $unset: { testiLockUntil: '', testiLastError: '' } });
             } else {
                 const upd = { $set: { testiLastError: String(res.reason).slice(0, 200) }, $unset: { testiLockUntil: '' } };
                 if (res.permanent) upd.$set.testiAttempts = MAX_ATTEMPTS; // jangan diulang lagi
-                await Order.updateOne({ orderId }, upd);
+                // Hanya pemilik kunci yang boleh melepasnya.
+                await Order.updateOne({ orderId, testiLockUntil: lockUntil }, upd);
             }
         } catch (e) {
             console.error('[TESTI] gagal menyimpan status antrean:', e.message);
         }
         if (!res.posted && res.reason !== 'nonaktif') {
             const again = !res.permanent && (order.testiAttempts || 0) < MAX_ATTEMPTS;
-            alertOwner(
-                `⚠️ Testimoni order ${orderId} gagal diposting ke ${channel()}\nSebab: ${res.reason}\n\n` +
-                (again
-                    ? 'Akan dicoba ulang otomatis tiap 10 menit.'
-                    : 'Tidak akan dicoba ulang otomatis. Pastikan bot ADMIN channel dengan izin "Post Messages", lalu kirim ulang dengan /testiulang ' + orderId)
-            );
+            if (again) {
+                alertOwner(`⚠️ Testimoni order ${orderId} gagal diposting ke ${channel()}\nSebab: ${res.reason}\n\nAkan dicoba ulang otomatis tiap 10 menit.`);
+            } else {
+                alertFinal(orderId, res.reason);
+            }
         }
         return res;
     }
@@ -704,10 +740,15 @@ function createTestimoni(cfg) {
         if (!o) return { posted: false, reason: 'order tidak ditemukan' };
         if (o.status !== 'PAID') return { posted: false, reason: `status order ${o.status}, bukan PAID` };
         if (o.testiPostedAt) return { posted: false, reason: 'sudah pernah diposting', postedAt: o.testiPostedAt };
-        await cfg.Order.updateOne(
-            { orderId },
-            { $set: { testiQueuedAt: o.testiQueuedAt || new Date(), testiMethod: o.testiMethod || methodFromOrder(o), testiAttempts: 0 }, $unset: { testiLockUntil: '' } }
+        const now = new Date();
+        // JANGAN buka kunci yang sedang dipakai (mis. testimoni sedang menunggu antrean Telegram)
+        // -> dulu ini membuat testimoni terposting dua kali.
+        const r = await cfg.Order.updateOne(
+            { orderId, testiPostedAt: null, $or: [{ testiLockUntil: null }, { testiLockUntil: { $lt: now } }] },
+            { $set: { testiQueuedAt: o.testiQueuedAt || now, testiMethod: o.testiMethod || methodFromOrder(o), testiAttempts: 0 } }
         );
+        const matched = r && (r.matchedCount !== undefined ? r.matchedCount : r.modifiedCount);
+        if (!matched) return { posted: false, reason: 'testimoni ini sedang diproses, tunggu beberapa menit lalu cek channel' };
         return attempt(bot, orderId);
     }
 

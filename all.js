@@ -60,6 +60,21 @@ connectDB();
 // Inisialisasi Express App dan Telegraf Bot
 const app = express();
 const bot = new Telegraf(process.env.BOT_TOKEN);
+// Setiap update Telegram diproses di LATAR BELAKANG. Tanpa ini Telegraf menunggu
+// handler selesai sebelum mengambil update berikutnya, jadi proses panjang
+// (cek Gmail, /statusdo, /cekdo, membuat QRIS) membuat bot diam untuk SEMUA pembeli.
+// Error tetap diteruskan ke bot.catch seperti biasa.
+bot.use((ctx, next) => {
+    Promise.resolve()
+        .then(next)
+        .catch((err) => {
+            try {
+                if (typeof bot.handleError === 'function') return bot.handleError(err, ctx);
+            } catch (e) { /* jatuh ke log di bawah */ }
+            console.error('[BOT] Error tak tertangani:', err);
+        })
+        .catch((e) => console.error('[BOT] Error di penanganan error:', e));
+});
 // Tombol "Matikan notifikasi" di bawah setiap testimoni channel. Didaftarkan PALING AWAL
 // supaya subscriber channel yang menekannya tidak ikut tercatat sebagai user bot.
 testimoni.attach(bot);
@@ -156,6 +171,12 @@ const MAINTENANCE_INTERVAL_HOURS = 6;
 function junkOrderExpiry() {
     return new Date(Date.now() + JUNK_ORDER_TTL_HOURS * 60 * 60 * 1000);
 }
+// QRIS Pakasir tetap bisa dibayar ±24 jam -> order Pakasir disimpan minimal 26 jam
+// supaya pembayaran telat masih bisa dicocokkan & akunnya dikirim.
+const PAKASIR_KEEP_HOURS = Math.max(JUNK_ORDER_TTL_HOURS, 26);
+function pakasirOrderExpiry() {
+    return new Date(Date.now() + PAKASIR_KEEP_HOURS * 60 * 60 * 1000);
+}
 
 // Pembersihan berkala: TTL index sudah menangani penghapusan order sampah,
 // job ini menangani hal yang tidak bisa dilakukan TTL (mengosongkan field)
@@ -174,8 +195,18 @@ async function runStorageMaintenance() {
             reservedItems: { $exists: true, $ne: [] }
         }).lean();
 
+        let restored = 0;
         for (const order of stranded) {
             try {
+                // KLAIM dulu (PENDING -> EXPIRED secara atomik), baru kembalikan stok.
+                // Kalau order keburu dibayar/diproses, klaim gagal & stok tidak disentuh
+                // (mencegah akun terkirim ke pembeli SEKALIGUS balik ke stok).
+                const claimed = await Order.findOneAndUpdate(
+                    { _id: order._id, status: 'PENDING' },
+                    { $set: { status: 'EXPIRED' } }
+                );
+                if (!claimed) continue;
+                restored += 1;
                 await Product.updateOne(
                     { id: order.productId, 'variants.slug': order.variantSlug },
                     {
@@ -183,22 +214,21 @@ async function runStorageMaintenance() {
                         $pull: { 'variants.$.reserved_stock': { $in: order.reservedItems } }
                     }
                 );
-                await Order.updateOne(
-                    { _id: order._id, status: 'PENDING' },
-                    { $set: { status: 'EXPIRED' } }
-                );
             } catch (itemError) {
                 console.error(`Gagal memulihkan stok order ${order.orderId}:`, itemError.message);
             }
         }
-        if (stranded.length > 0) {
-            console.log(`♻️  Maintenance: stok dari ${stranded.length} order nyangkut dikembalikan.`);
+        if (restored > 0) {
+            console.log(`♻️  Maintenance: stok dari ${restored} order nyangkut dikembalikan.`);
         }
 
         const junkCutoff = new Date(Date.now() - JUNK_ORDER_TTL_HOURS * 60 * 60 * 1000);
+        const pakasirCutoff = new Date(Date.now() - PAKASIR_KEEP_HOURS * 60 * 60 * 1000);
         const deleted = await Order.deleteMany({
             status: { $ne: 'PAID' },
-            createdAt: { $lt: junkCutoff }
+            createdAt: { $lt: junkCutoff },
+            // order Pakasir ditahan lebih lama (pembayaran telat masih mungkin masuk)
+            $or: [{ paymentGateway: { $ne: 'pakasir' } }, { createdAt: { $lt: pakasirCutoff } }],
         });
 
         const stripCutoff = new Date(Date.now() - PAID_ITEMS_RETENTION_DAYS * 24 * 60 * 60 * 1000);
@@ -228,33 +258,34 @@ async function sendAdminNotification(bot, order) {
         return;
     }
 
+    // 1. Pesan notifikasi (nama pembeli/produk di-escape supaya Markdown tidak rusak)
+    const message = [
+        '✅ *Transaksi Baru Berhasil*',
+        `*Waktu:* ${moment(order.paidAt || new Date()).tz('Asia/Jakarta').format('HH:mm DD/MM/YY')}`,
+        `*User:* ${escapeMd(order.customerInfo?.first_name || '-')} (${order.customerInfo?.telegramUserId || '-'})`,
+        `*Produk:* ${escapeMd(order.productName)} - ${escapeMd(order.variantName)}`,
+        `*Jumlah:* ${order.quantity}x`,
+        `*Total:* Rp ${Number(order.totalPaid || order.amount || 0).toLocaleString('id-ID')}`,
+        `*Metode:* ${escapeMd(String(order.paymentGateway || '-').toUpperCase())}`,
+        `*ID Order:* ${escapeMd(order.orderId)}`
+    ].join('\n');
     try {
-        // 1. Format Pesan Notifikasi
-        const message = [
-            '✅ *Transaksi Baru Berhasil*',
-            `*Waktu:* ${moment(order.paidAt).tz('Asia/Jakarta').format('HH:mm DD/MM/YY')}`,
-            `*User:* @${order.customerInfo.first_name} (${order.customerInfo.telegramUserId})`,
-            `*Produk:* ${order.productName} - ${order.variantName}`,
-            `*Jumlah:* ${order.quantity}x`,
-            `*Total:* Rp ${order.amount.toLocaleString('id-ID')}`,
-            `*Metode:* ${order.paymentGateway.toUpperCase()}`,
-            `*ID Order:* ${order.orderId}`
-        ].join('\n');
-
         await bot.telegram.sendMessage(GROUP_NOTIF_ID, message, { parse_mode: 'Markdown' });
+    } catch (error) {
+        await bot.telegram.sendMessage(GROUP_NOTIF_ID, message.replace(/\\([_*`\[])/g, '$1').replace(/\*/g, ''))
+            .catch((e2) => console.error(`Gagal mengirim notifikasi admin untuk order ${order.orderId}:`, e2.message));
+    }
 
-        // 2. Buat dan Kirim File .txt
-        const fileContent = order.reservedItems.join('\n');
-        const fileName = `akun_${order.orderId}.txt`;
-
+    // 2. File .txt akun (tetap dikirim walau pesan di atas gagal)
+    try {
+        const fileContent = formatItemsForFile(order.reservedItems);
         await bot.telegram.sendDocument(
             GROUP_NOTIF_ID,
-            { source: Buffer.from(fileContent, 'utf-8'), filename: fileName },
+            { source: Buffer.from(fileContent || '(kosong)', 'utf-8'), filename: `akun_${order.orderId}.txt` },
             { caption: `Akun untuk order ${order.orderId}` }
         );
-
     } catch (error) {
-        console.error(`Gagal mengirim notifikasi admin untuk order ${order.orderId}:`, error);
+        console.error(`Gagal mengirim file notifikasi admin untuk order ${order.orderId}:`, error.message);
     }
 }
 
@@ -290,23 +321,30 @@ async function notifyOwnerNewOrder(order) {
         waktu = new Date().toISOString();
     }
 
-    const nama = order.customerInfo?.first_name ? ` (${order.customerInfo.first_name})` : '';
+    const nama = order.customerInfo?.first_name ? ` (${escapeMd(order.customerInfo.first_name)})` : '';
     const msg = [
-        '🛒 *Order Baru — Sudah Dibayar*',
+        '🛒 *Order Baru — Sudah Dibayar*' + (order.latePaid ? ' (bayar telat)' : ''),
         `👤 User ID: \`${order.customerInfo?.telegramUserId || '-'}\`${nama}`,
-        `📦 Produk: ${order.productName || '-'}${order.variantName ? ' - ' + order.variantName : ''}`,
+        `📦 Produk: ${escapeMd(order.productName || '-')}${order.variantName ? ' - ' + escapeMd(order.variantName) : ''}`,
         `🔢 Jumlah: ${order.quantity || 1}x`,
-        `💰 Harga: Rp ${Number(order.amount || 0).toLocaleString('id-ID')}`,
-        `💳 Metode: ${(order.paymentGateway || '-').toUpperCase()}`,
+        `💰 Harga: Rp ${Number(order.amount || 0).toLocaleString('id-ID')}` +
+            (order.totalPaid && order.totalPaid !== order.amount ? ` (dibayar Rp ${Number(order.totalPaid).toLocaleString('id-ID')} termasuk biaya QRIS)` : ''),
+        `💳 Metode: ${escapeMd((order.paymentGateway || '-').toUpperCase())}`,
         `🧾 Order ID: \`${order.orderId}\``,
         `🕒 ${waktu}`,
-    ].join('\n');
+    ];
+    const text = msg.join('\n');
 
     for (const ownerId of owners) {
         try {
-            await bot.telegram.sendMessage(ownerId, msg, { parse_mode: 'Markdown' });
+            await bot.telegram.sendMessage(ownerId, text, { parse_mode: 'Markdown' });
         } catch (e) {
-            console.error(`[ORDER-NOTIF] gagal kirim ke owner ${ownerId}:`, e.message);
+            // Masih gagal format -> kirim ulang sebagai teks biasa (notif tidak boleh hilang).
+            try {
+                await bot.telegram.sendMessage(ownerId, text.replace(/\\([_*`\[])/g, '$1').replace(/[*`]/g, ''));
+            } catch (e2) {
+                console.error(`[ORDER-NOTIF] gagal kirim ke owner ${ownerId}:`, e2.message);
+            }
         }
     }
 }
@@ -319,15 +357,16 @@ async function alertOwnerDeliveryFailed(order, reason) {
         '',
         `Order \`${order.orderId}\` sudah *DIBAYAR* tetapi akun *GAGAL terkirim*.`,
         `User: \`${order.customerInfo?.telegramUserId || '-'}\``,
-        `Produk: ${order.productName} - ${order.variantName}`,
+        `Produk: ${escapeMd(order.productName)} - ${escapeMd(order.variantName)}`,
         `Jumlah: ${order.quantity}x`,
-        `Sebab: ${reason}`,
+        `Sebab: ${escapeMd(reason)}`,
         '',
         `Kirim manual akun di file berikut, lalu jalankan \`/resend ${order.orderId}\`.`,
     ].join('\n');
     const fileContent = formatItemsForFile(order.reservedItems || []);
     for (const o of owners) {
-        await bot.telegram.sendMessage(o, head, { parse_mode: 'Markdown' }).catch(() => {});
+        await bot.telegram.sendMessage(o, head, { parse_mode: 'Markdown' })
+            .catch(() => bot.telegram.sendMessage(o, head.replace(/\\([_*`\[])/g, '$1').replace(/[*`]/g, '')).catch(() => {}));
         await bot.telegram.sendDocument(
             o,
             { source: Buffer.from(fileContent || '(kosong)', 'utf-8'), filename: `BELUM_TERKIRIM_${order.orderId}.txt` },
@@ -341,8 +380,11 @@ async function sendMessageWithFallback(chatId, markdownMsg) {
         await bot.telegram.sendMessage(chatId, markdownMsg, { parse_mode: 'Markdown' });
     } catch (e) {
         console.warn(`[DELIVERY] Markdown gagal (${e.message}), coba teks biasa...`);
-        const plain = markdownMsg.replace(/```/g, '').replace(/[*_`]/g, '');
-        await bot.telegram.sendMessage(chatId, plain);
+        // PENTING: isi akun (email/password) TIDAK BOLEH diubah. Dulu karakter _ * ` dihapus
+        // sehingga "john_doe@gmail.com" terkirim jadi "johndoe@gmail.com". Sekarang hanya
+        // pembatas blok ``` yang dibuang; teks lain dikirim apa adanya tanpa format.
+        const plain = markdownMsg.replace(/```\n?/g, '');
+        await bot.telegram.sendMessage(chatId, plain); // tanpa parse_mode
     }
 }
 
@@ -363,7 +405,7 @@ async function deliverAccountsToCustomer(order, methodLabel) {
 
     // Branding ALIM STORE dipertahankan.
     const infoLine =
-        `*Info Pembelian:*\n– Total: Rp ${Number(order.amount).toLocaleString('id-ID')}\n` +
+        `*Info Pembelian:*\n– Total: Rp ${Number(order.totalPaid || order.amount).toLocaleString('id-ID')}\n` +
         `– Metode: ${methodLabel}\n– ID Transaksi: \`${order.orderId}\``;
     const header = `🧾 *Pembelian Berhasil*\n\nTerima kasih!, Jika Ada Pertanyaan Silahkan Chat Admin Di wa.me/6285753323094\n\n`;
 
@@ -390,9 +432,9 @@ async function deliverAccountsToCustomer(order, methodLabel) {
 
         const wasFirstDelivery = !order.delivered;
         await markOrderDelivered(order.orderId);
-        if (GROUP_NOTIF_ID) await sendAdminNotification(bot, order).catch(() => {});
-        // Notif owner + testimoni channel hanya saat pengiriman PERTAMA (bukan saat /resend).
+        // Notif grup + owner + testimoni channel hanya saat pengiriman PERTAMA (bukan saat /resend).
         if (wasFirstDelivery) {
+            if (GROUP_NOTIF_ID) await sendAdminNotification(bot, order).catch(() => {});
             await notifyOwnerNewOrder(order).catch(() => {});
             // Testimoni ke channel — sengaja TIDAK di-await: posting ke channel tidak boleh
             // menahan atau menggagalkan pengiriman akun ke customer.
@@ -407,29 +449,31 @@ async function deliverAccountsToCustomer(order, methodLabel) {
 }
 
 async function handlePaymentCreationError(productId, variantSlug, reservedItems, internalOrderId) {
-    // Fungsi ini dipanggil jika pembuatan invoice gagal SETELAH stok berhasil dicadangkan.
-    if (reservedItems && reservedItems.length > 0) {
-        console.log(`[RECOVERY] Error saat membuat invoice untuk order ${internalOrderId}. Mengembalikan ${reservedItems.length} item stok.`);
-        try {
-            // 1. Kembalikan stok yang dicadangkan ke stok utama
-            await Product.updateOne(
-                { id: productId, "variants.slug": variantSlug },
-                {
-                    $pull: { "variants.$.reserved_stock": { $in: reservedItems } }, // Tarik dari reserved_stock
-                    $push: { "variants.$.stock": { $each: reservedItems } }      // Masukkan kembali ke stock
-                }
-            );
-
-            // 2. Tandai pesanan sebagai GAGAL di database
-            await Order.updateOne(
-                // Mencari berdasarkan ID internal yang unik untuk semua gateway
-                { $or: [{ orderId: internalOrderId }, { internalRefId: internalOrderId }] },
-                { $set: { status: 'FAILED' } }
-            );
-            console.log(`[RECOVERY] Stok untuk order ${internalOrderId} berhasil dikembalikan.`);
-        } catch (recoveryError) {
-            console.error(`[FATAL RECOVERY ERROR] Gagal mengembalikan stok untuk order ${internalOrderId}:`, recoveryError);
-            // Di sini bisa ditambahkan notifikasi ke admin jika recovery gagal total
+    // Dipanggil jika pembuatan invoice gagal SETELAH stok berhasil dicadangkan.
+    if (!reservedItems || reservedItems.length === 0) return;
+    console.log(`[RECOVERY] Error saat membuat invoice untuk order ${internalOrderId}. Mengembalikan ${reservedItems.length} item stok.`);
+    try {
+        // 1. Tandai GAGAL dulu (hanya kalau masih PENDING). Kalau order ternyata sudah
+        //    dibayar/diproses, stok TIDAK dikembalikan (mencegah akun dijual dua kali).
+        const orderQuery = { $or: [{ orderId: internalOrderId }, { internalRefId: internalOrderId }] };
+        const claimed = await Order.findOneAndUpdate({ ...orderQuery, status: 'PENDING' }, { $set: { status: 'FAILED' } });
+        if (!claimed && await Order.exists(orderQuery)) {
+            console.warn(`[RECOVERY] Order ${internalOrderId} sudah tidak PENDING — stok tidak dikembalikan.`);
+            return;
+        }
+        // 2. Kembalikan stok yang dicadangkan ke stok utama
+        await Product.updateOne(
+            { id: productId, "variants.slug": variantSlug },
+            {
+                $pull: { "variants.$.reserved_stock": { $in: reservedItems } },
+                $push: { "variants.$.stock": { $each: reservedItems } }
+            }
+        );
+        console.log(`[RECOVERY] Stok untuk order ${internalOrderId} berhasil dikembalikan.`);
+    } catch (recoveryError) {
+        console.error(`[FATAL RECOVERY ERROR] Gagal mengembalikan stok untuk order ${internalOrderId}:`, recoveryError);
+        for (const id of ownerIdList()) {
+            await bot.telegram.sendMessage(id, `🚨 Gagal mengembalikan stok order ${internalOrderId}: ${recoveryError.message}\nCek reserved_stock produk ${productId}/${variantSlug}.`).catch(() => {});
         }
     }
 }
@@ -460,14 +504,37 @@ app.use(bodyParser.urlencoded({ extended: true }));
 // verify: simpan body mentah untuk validasi tanda tangan webhook QRIN.
 app.use(bodyParser.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(session({
-    secret: 'telegram-bot-admin-secret-key-super-aman',
+    // Secret dari env; kalau kosong dibuat acak tiap bot menyala (login ulang setelah restart).
+    secret: process.env.SESSION_SECRET || require('crypto').randomBytes(32).toString('hex'),
     resave: false,
-    saveUninitialized: true,
-    cookie: { maxAge: 60 * 60 * 1000 }
+    saveUninitialized: false,
+    // sameSite 'strict' = cookie login tidak ikut terkirim dari situs lain (anti CSRF).
+    cookie: { maxAge: 60 * 60 * 1000, httpOnly: true, sameSite: 'strict' }
 }));
 
-const ADMIN_USERNAME = 'gen';
-const ADMIN_PASSWORD = 'gen';
+// Login panel web diambil dari env (Render -> Environment):
+//   ADMIN_USERNAME=...   ADMIN_PASSWORD=...
+// Kalau belum diisi, sementara masih memakai gen/gen (owner diberi peringatan).
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'gen';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'gen';
+const ADMIN_DEFAULT_LOGIN = !process.env.ADMIN_USERNAME || !process.env.ADMIN_PASSWORD;
+if (ADMIN_DEFAULT_LOGIN) console.warn('[PANEL] ADMIN_USERNAME/ADMIN_PASSWORD belum diisi di env -> login panel masih gen/gen (TIDAK AMAN).');
+
+function safeEqual(a, b) {
+    const crypto = require('crypto');
+    const ha = crypto.createHash('sha256').update(String(a || '')).digest();
+    const hb = crypto.createHash('sha256').update(String(b || '')).digest();
+    return crypto.timingSafeEqual(ha, hb);
+}
+
+// Batasi percobaan login salah: 5x per 15 menit per IP.
+const loginFails = new Map();
+function clientIp(req) {
+    // Ambil entri TERAKHIR X-Forwarded-For (ditambahkan proxy Render, tidak bisa dipalsukan
+    // pembeli); entri depan bisa diisi sembarang oleh penyerang.
+    const parts = String(req.headers['x-forwarded-for'] || '').split(',').map((s) => s.trim()).filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : String(req.socket.remoteAddress || '');
+}
 
 const authMiddleware = (req, res, next) => {
     if (req.session.loggedin) {
@@ -482,12 +549,27 @@ const authMiddleware = (req, res, next) => {
 app.get('/login', (req, res) => res.render('login', { error: req.query.error, success: req.query.success, locals: {} }));
 
 app.post('/login', (req, res) => {
+    const ip = clientIp(req);
+    const now = Date.now();
+    const rec = loginFails.get(ip);
+    if (rec && rec.count >= 5 && now - rec.first < 15 * 60 * 1000) {
+        return res.redirect('/login?error=' + encodeURIComponent('Terlalu banyak percobaan. Coba lagi 15 menit lagi.'));
+    }
     const { username, password } = req.body;
-    if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
-        req.session.loggedin = true;
-        req.session.user = { username };
-        res.redirect('/');
+    if (safeEqual(username, ADMIN_USERNAME) && safeEqual(password, ADMIN_PASSWORD)) {
+        loginFails.delete(ip);
+        req.session.regenerate(() => {
+            req.session.loggedin = true;
+            req.session.user = { username: String(username) };
+            res.redirect('/');
+        });
     } else {
+        if (!rec || now - rec.first >= 15 * 60 * 1000) loginFails.set(ip, { count: 1, first: now });
+        else rec.count += 1;
+        if (loginFails.size > 5000) {
+            // buang catatan yang sudah lewat 15 menit saja (bukan semuanya)
+            for (const [k, v] of loginFails) if (now - v.first >= 15 * 60 * 1000) loginFails.delete(k);
+        }
         res.redirect('/login?error=Invalid username or password');
     }
 });
@@ -688,6 +770,12 @@ app.post('/products/add', authMiddleware, async (req, res) => {
 app.get('/products/manage/:id', authMiddleware, async (req, res) => {
     const product = await Product.findOne({ id: req.params.id }).lean();
     if (!product) return res.status(404).send('Product not found');
+    // Simpan salinan stok SAAT halaman dibuka -> saat disimpan, hanya PERUBAHAN yang
+    // diterapkan (akun yang terjual selama halaman terbuka tidak balik ke stok).
+    req.session.stockSnap = req.session.stockSnap || {};
+    for (const v of product.variants || []) {
+        req.session.stockSnap[`${product.id}|${v.slug}`] = Array.isArray(v.stock) ? v.stock : [];
+    }
     res.render('layout', {
         page: 'products',
         body: await ejs.renderFile(path.join(__dirname, 'views/manage-product.ejs'), { product })
@@ -726,11 +814,25 @@ app.get('/products/variants/delete/:id/:slug', authMiddleware, async (req, res) 
 });
 
 app.post('/products/stock/update/:id/:slug', authMiddleware, async (req, res) => {
-    const updatedStockList = req.body.current_stock.split(/\r?\n/).filter(line => line.trim() !== '');
-    await Product.updateOne(
-        { id: req.params.id, "variants.slug": req.params.slug },
-        { $set: { "variants.$.stock": updatedStockList } }
-    );
+    const key = `${req.params.id}|${req.params.slug}`;
+    const snap = req.session.stockSnap && req.session.stockSnap[key];
+    if (!Array.isArray(snap)) {
+        return res.status(409).send('Halaman stok sudah kedaluwarsa. Kembali, muat ulang halaman produk, lalu simpan lagi.');
+    }
+    const submitted = String(req.body.current_stock || '').split(/\r?\n/).filter(line => line.trim() !== '');
+    // Hitung selisih (dengan memperhatikan duplikat) antara salinan awal & isi form.
+    const count = (arr) => arr.reduce((m, x) => m.set(x, (m.get(x) || 0) + 1), new Map());
+    const before = count(snap);
+    const after = count(submitted);
+    const removed = [];
+    const added = [];
+    for (const [item, n] of before) if ((after.get(item) || 0) < n) removed.push(item);
+    for (const [item, n] of after) for (let i = (before.get(item) || 0); i < n; i++) added.push(item);
+    const filter = { id: req.params.id, "variants.slug": req.params.slug };
+    if (removed.length) await Product.updateOne(filter, { $pull: { "variants.$.stock": { $in: removed } } });
+    if (added.length) await Product.updateOne(filter, { $push: { "variants.$.stock": { $each: added } } });
+    delete req.session.stockSnap[key];
+    console.log(`[PANEL] Stok ${key}: +${added.length} / -${removed.length} (perubahan saja, stok terbaru tidak ditimpa).`);
     res.redirect(`/products/manage/${req.params.id}`);
 });
 
@@ -797,11 +899,27 @@ app.post('/broadcast/send', authMiddleware, upload.single('image_file'), async (
     }
 });
 
+// Nama file aset HANYA boleh file gambar yang sudah ada di folder assets (mis. welcome.png).
+// Dulu nama dari form dipakai mentah -> "../views/login.ejs" bisa menimpa file server.
+const ASSET_DIR = path.join(__dirname, 'assets');
+const ASSET_TMP_DIR = path.join(__dirname, '.upload-tmp'); // di luar folder publik
+const ASSET_ALLOWED = new Set(['welcome.png']); // aset yang boleh diganti dari panel
+function safeAssetName(raw) {
+    const name = String(raw || '');
+    if (!name || path.basename(name) !== name) return null;          // tolak ../ dan folder
+    if (!/^[\w.\- ]+\.(png|jpe?g|gif|webp)$/i.test(name)) return null;
+    if (!ASSET_ALLOWED.has(name) && !require('fs').existsSync(path.join(ASSET_DIR, name))) return null;
+    return name;
+}
+// File diunggah ke folder sementara dulu; baru dipindah ke assets kalau upload sukses,
+// jadi upload gagal/terputus tidak merusak/menghapus gambar yang lama.
 const assetStorage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, path.join(__dirname, 'assets')),
-    filename: (req, file, cb) => cb(null, req.body.asset_to_replace)
+    destination: (req, file, cb) => {
+        require('fs').mkdir(ASSET_TMP_DIR, { recursive: true }, (err) => cb(err || null, ASSET_TMP_DIR));
+    },
+    filename: (req, file, cb) => cb(null, `${Date.now()}-${Math.random().toString(36).slice(2)}.upload`)
 });
-const assetUpload = multer({ storage: assetStorage });
+const assetUpload = multer({ storage: assetStorage, limits: { fileSize: 10 * 1024 * 1024 } });
 
 app.get('/assets', authMiddleware, async (req, res) => {
     res.render('layout', {
@@ -812,11 +930,25 @@ app.get('/assets', authMiddleware, async (req, res) => {
     });
 });
 
-app.post('/assets/replace', authMiddleware, assetUpload.single('new_image_file'), (req, res) => {
-    if (!req.file) {
-        return res.redirect('/assets?error=You did not select a file to upload.');
-    }
-    res.redirect(`/assets?success=Successfully replaced ${req.body.asset_to_replace}`);
+app.post('/assets/replace', authMiddleware, (req, res) => {
+    assetUpload.single('new_image_file')(req, res, async (err) => {
+        if (err) return res.redirect('/assets?error=' + encodeURIComponent('Gagal mengganti aset: ' + err.message));
+        if (!req.file) {
+            return res.redirect('/assets?error=You did not select a file to upload.');
+        }
+        const name = safeAssetName(req.body.asset_to_replace);
+        if (!name) {
+            await fs.unlink(req.file.path).catch(() => {});
+            return res.redirect('/assets?error=' + encodeURIComponent('Nama aset tidak valid.'));
+        }
+        try {
+            await fs.rename(req.file.path, path.join(ASSET_DIR, name));
+        } catch (e) {
+            await fs.unlink(req.file.path).catch(() => {});
+            return res.redirect('/assets?error=' + encodeURIComponent('Gagal menyimpan aset: ' + e.message));
+        }
+        res.redirect(`/assets?success=${encodeURIComponent('Successfully replaced ' + name)}`);
+    });
 });
 
 app.get('/payment-gateways', authMiddleware, async (req, res) => {
@@ -880,7 +1012,7 @@ adminModule(bot);
 // menolak seluruh pesan ("can't parse entities") sehingga /start gagal.
 function escapeMd(text) {
     return String(text === null || text === undefined ? '' : text)
-        .replace(/([_*`\[\]])/g, '\\$1');
+        .replace(/([_*`\[])/g, '\\$1');
 }
 
 // === HELPER: pastikan dokumen user SELALU ada ===
@@ -2102,7 +2234,7 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
     let transactionCommitted = false;
 
     try {
-        await ctx.deleteMessage();
+        await ctx.deleteMessage().catch(() => {});
         workingMsg = await ctx.reply('⏳ *Menyiapkan QRIS, mohon tunggu...*', { parse_mode: 'Markdown' });
 
         const product = await Product.findOne({ id: productId }).session(session);
@@ -2123,66 +2255,67 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         }
         const totalHarga = quantity * hargaPerPcs;
 
-        const orderDetails = { productId, variantSlug, productName: product.name, variantName: variant.name, quantity, reservedItems };
-        const customerInfo = { telegramUserId: ctx.from.id.toString(), first_name: ctx.from.first_name };
-
-        const rawPayment = await pakasir.createTransaction(internalOrderId, totalHarga);
-        console.log("[PAKASIR] Raw payment response:", JSON.stringify(rawPayment, null, 2));
-
-        const payment = {
-            displayOrderId: rawPayment.displayOrderId,   // = internalOrderId (ALIM-...)
-            realOrderId: rawPayment.realOrderId,
-            txnId: rawPayment.txnId,                     // v2: WAJIB utk cek status (polling)
-            qrString: rawPayment.qrString,
-            amount: rawPayment.amount,                   // nominal dasar (diterima merchant)
-            totalBayar: rawPayment.totalBayar,           // dibayar customer (sudah + fee)
-            fee: rawPayment.fee,
-        };
-
-        if (!payment.qrString) throw new Error("QR String tidak ditemukan dari response Pakasir");
-
-        const newOrder = new Order({
-            orderId: payment.displayOrderId,
-            realOrderId: payment.realOrderId,
-            pakasirTxnId: payment.txnId,
-            fee: payment.fee,                 // biaya QRIS (ditanggung customer)
-            totalPaid: payment.totalBayar,    // total yang dibayar customer
+        // Simpan reservasi stok + order DULU (transaksi DB singkat), baru panggil Pakasir
+        // di LUAR transaksi. Dengan begitu pembeli lain tidak kena "write conflict" saat
+        // server Pakasir lambat. Kalau Pakasir gagal, stok dikembalikan oleh
+        // handlePaymentCreationError (order ditandai FAILED).
+        await new Order({
+            orderId: internalOrderId,
             internalRefId: internalOrderId,
-            depositId: payment.realOrderId,
-            amount: totalHarga,
+            amount: totalHarga,           // nominal dasar (diterima merchant) -> statistik
             status: "PENDING",
-            expiresAt: junkOrderExpiry(),
-            ...orderDetails,
-            customerInfo,
+            expiresAt: pakasirOrderExpiry(),
+            productId, variantSlug, productName: product.name, variantName: variant.name, quantity, reservedItems,
+            customerInfo: { telegramUserId: ctx.from.id.toString(), first_name: ctx.from.first_name },
             paymentGateway: "pakasir",
-        });
-        await newOrder.save({ session });
+        }).save({ session });
         await session.commitTransaction();
         transactionCommitted = true;
 
+        const rawPayment = await pakasir.createTransaction(internalOrderId, totalHarga);
+        console.log('[PAKASIR] Invoice dibuat:', JSON.stringify({ order: internalOrderId, txn: rawPayment.txnId, amount: rawPayment.amount, fee: rawPayment.fee, total: rawPayment.totalBayar }));
+
+        const payment = {
+            displayOrderId: internalOrderId,
+            realOrderId: rawPayment.realOrderId,
+            txnId: rawPayment.txnId,                     // v2: WAJIB utk cek status
+            qrString: rawPayment.qrString,
+            amount: rawPayment.amount,                   // nominal dasar (diterima merchant)
+            totalBayar: rawPayment.totalBayar,           // yang dibayar customer (sudah + fee)
+            fee: rawPayment.fee,
+        };
+        if (!payment.qrString) throw new Error("QR String tidak ditemukan dari response Pakasir");
+
+        await Order.updateOne(
+            { orderId: internalOrderId },
+            { $set: { pakasirTxnId: payment.txnId, fee: payment.fee, totalPaid: payment.totalBayar, depositId: payment.realOrderId } }
+        );
+
         const qrDataURL = await QRCode.toDataURL(payment.qrString, {
-            type: 'image/png',
-            width: 512,
-            margin: 2,
-            errorCorrectionLevel: 'M',
+            type: 'image/png', width: 512, margin: 2, errorCorrectionLevel: 'M',
             color: { dark: '#000000', light: '#FFFFFF' }
         });
         const qrBuffer = Buffer.from(qrDataURL.split(",")[1], "base64");
 
-        const caption = `📁 *Invoice Berhasil Dibuat*\n\`\`\`\n${payment.displayOrderId}\n\`\`\`\n────────────✧\n*QRIS SEMUA PEMBAYARAN*\n────────────✧\n*Informasi Item:*\n— Nama: ${product.name.toUpperCase()} - ${variant.name}\n— Jumlah: ${quantity}x\n\n*Informasi Pembayaran:*\n— ID Transaksi: \`${payment.displayOrderId}\`\n— Harga: Rp ${Number(payment.amount).toLocaleString('id-ID')}\n— Biaya QRIS: Rp ${Number(payment.fee).toLocaleString('id-ID')}\n— Total Dibayar: Rp ${Number(payment.totalBayar).toLocaleString('id-ID')}\n— Kedaluwarsa dalam: 5 Menit`;
+        // Nama produk/varian di-escape supaya karakter _ * ` [ tidak merusak format (invoice gagal tampil).
+        const caption = `📁 *Invoice Berhasil Dibuat*\n\`\`\`\n${payment.displayOrderId}\n\`\`\`\n────────────✧\n*QRIS SEMUA PEMBAYARAN*\n────────────✧\n*Informasi Item:*\n— Nama: ${escapeMd(String(product.name).toUpperCase())} - ${escapeMd(variant.name)}\n— Jumlah: ${quantity}x\n\n*Informasi Pembayaran:*\n— ID Transaksi: \`${payment.displayOrderId}\`\n— Harga: Rp ${Number(payment.amount).toLocaleString('id-ID')}\n— Biaya QRIS: Rp ${Number(payment.fee).toLocaleString('id-ID')}\n— Total Dibayar: Rp ${Number(payment.totalBayar).toLocaleString('id-ID')}\n— Kedaluwarsa dalam: 5 Menit`;
         const keyboard = Markup.inlineKeyboard([[Markup.button.callback('Batalkan Pembelian', `cancel_payment_pakasir_${payment.displayOrderId}`)]]);
 
         await ctx.deleteMessage().catch(() => {});
+        // hapus "⏳ Menyiapkan QRIS..." supaya tidak tertinggal di chat
+        if (workingMsg) { await ctx.deleteMessage(workingMsg.message_id).catch(() => {}); workingMsg = null; }
         qrPhotoMsg = await ctx.replyWithPhoto({ source: qrBuffer }, { caption, parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+        await Order.updateOne({ orderId: internalOrderId }, { $set: { qrMsgId: qrPhotoMsg.message_id } }).catch(() => {});
 
-        // ===== KONFIRMASI VIA POLLING (Pakasir v2 punya endpoint cek status) =====
-        // Mandiri — tidak bergantung webhook. Cek status tiap 5 detik, maks 5 menit.
+        // ===== KONFIRMASI VIA POLLING (tiap 5 detik, maks 5 menit) =====
+        // Cadangan: sweepPakasirOrders() mengecek ulang tiap 2 menit (restart / bayar telat).
         const pollInterval = 5000;
         const pollDuration = 300000; // 5 menit
-        let isHandled = false;
+        let isHandled = false;       // timer sudah dihentikan (lunas / kedaluwarsa)
+        let polling = false;         // cegah request cek status menumpuk
         const startedAt = Date.now();
 
-        const finish = async () => {
+        const finish = () => {
             const s = paymentSessions.get(payment.displayOrderId);
             if (s) {
                 clearInterval(s.pollingId);
@@ -2191,42 +2324,48 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
             }
         };
 
+        // Pembayaran terdeteksi -> kirim akun (fungsi ini juga menghapus QR).
+        // Kalau order keburu ditandai kedaluwarsa (bayar di detik terakhir),
+        // diproses sebagai pembayaran telat.
+        const onPaid = async () => {
+            try {
+                const r = await fulfillPakasirPaidOrder(payment.displayOrderId);
+                if (!r.ok && r.reason === 'not_pending') await fulfillLatePakasirOrder(payment.displayOrderId);
+            } finally {
+                // Walau terjadi error DB, timer dihentikan & sesi dilepas -> sweeper 2 menitan
+                // yang akan mencoba lagi (order tidak "nyangkut" dipantau polling mati).
+                finish();
+                await bot.telegram.deleteMessage(ctx.chat.id, qrPhotoMsg.message_id).catch(() => {});
+            }
+        };
+
         const handleExpiry = async () => {
             if (isHandled) return;
             isHandled = true;
-            await finish();
-            const expired = await Order.findOneAndUpdate(
-                { orderId: payment.displayOrderId, status: 'PENDING' },
-                { $set: { status: 'EXPIRED' } }
-            );
+            finish();
+            // Cek terakhir ke Pakasir: jangan batalkan order yang ternyata sudah dibayar.
+            if (await pakasirStatusOf(payment.txnId) === 'completed') { await onPaid(); return; }
+            const expired = await expirePakasirOrder(payment.displayOrderId);
             if (!expired) return; // sudah dibayar / diproses
-
-            await Product.updateOne(
-                { id: productId, "variants.slug": variantSlug },
-                {
-                    $push: { "variants.$.stock": { $each: reservedItems } },
-                    $pull: { "variants.$.reserved_stock": { $in: reservedItems } }
-                }
-            );
-
             await bot.telegram.deleteMessage(ctx.chat.id, qrPhotoMsg.message_id).catch(() => {});
-            await bot.telegram.sendMessage(ctx.from.id, `📜 *Tagihan Kadaluarsa*\n\nTagihan untuk ID \`${payment.displayOrderId}\` telah kadaluarsa.`, { parse_mode: 'Markdown' }).catch(() => {});
+            await bot.telegram.sendMessage(ctx.from.id, `📜 *Tagihan Kadaluarsa*\n\nTagihan untuk ID \`${payment.displayOrderId}\` telah kadaluarsa.\nJika Anda terlanjur membayar, tenang — akun tetap dikirim otomatis begitu pembayaran terdeteksi.`, { parse_mode: 'Markdown' }).catch(() => {});
         };
 
         const pollOnce = async () => {
-            if (isHandled) return;
+            if (isHandled || polling) return;
             if (Date.now() - startedAt > pollDuration) { await handleExpiry(); return; }
+            polling = true;
             try {
-                const res = await pakasir.checkPaymentStatus(payment.txnId);
-                const status = String(res?.status || '').toLowerCase();
-                if (status === 'completed') {
-                    if (isHandled) return;
+                if (await pakasirStatusOf(payment.txnId) === 'completed') {
+                    // Tetap diproses walau timer kedaluwarsa jalan bersamaan: fungsi pemenuhan
+                    // bersifat atomik, jadi akun tidak mungkin terkirim dua kali.
                     isHandled = true;
-                    await finish();
-                    await fulfillPakasirPaidOrder(payment.displayOrderId);
+                    await onPaid();
                 }
             } catch (e) {
                 console.error('[PAKASIR] poll error:', e.message);
+            } finally {
+                polling = false;
             }
         };
 
@@ -2241,16 +2380,22 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
 
     } catch (error) {
         console.error('[PAKASIR] Error in action:', error);
-
         if (!transactionCommitted) {
-            await session.abortTransaction();
+            await session.abortTransaction().catch(() => {});
         } else {
             await handlePaymentCreationError(productId, variantSlug, reservedItems, internalOrderId);
         }
-
+        const stokHabis = !!(error && error.message === 'Maaf, stok tidak mencukupi.');
         if (workingMsg) await ctx.deleteMessage(workingMsg.message_id).catch(() => {});
-        await ctx.reply('❌ Maaf, terjadi kesalahan internal saat membuat invoice. Silakan coba lagi nanti.');
-
+        await ctx.reply(stokHabis
+            ? '❌ Maaf, stok tidak mencukupi (baru saja habis dibeli). Silakan kurangi jumlah atau coba lagi nanti.'
+            : '❌ Maaf, terjadi kesalahan internal saat membuat invoice. Silakan coba lagi nanti.').catch(() => {});
+        if (!stokHabis) {
+            const detail = (error && error.message) ? error.message : String(error);
+            for (const ownerId of ownerIdList()) {
+                await bot.telegram.sendMessage(ownerId, `⚠️ [DEBUG PAKASIR] Gagal membuat invoice:\n${detail}`).catch(() => {});
+            }
+        }
     } finally {
         session.endSession();
     }
@@ -2258,6 +2403,7 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
 
 // ===== Pemenuhan order Pakasir yang sudah dibayar (dipanggil polling / reconcile) =====
 async function fulfillPakasirPaidOrder(orderId) {
+    // Idempoten: hanya proses order yang MASIH PENDING (aman thd polling + webhook + sweeper).
     const order = await Order.findOneAndUpdate(
         { orderId: orderId, status: 'PENDING' },
         { $set: { status: 'PAID', paidAt: new Date() }, $unset: { expiresAt: "" } },
@@ -2277,6 +2423,9 @@ async function fulfillPakasirPaidOrder(orderId) {
         if (sess.chatId && sess.qrPhotoMsgId) {
             await bot.telegram.deleteMessage(sess.chatId, sess.qrPhotoMsgId).catch(() => {});
         }
+    } else if (order.qrMsgId && order.customerInfo && order.customerInfo.telegramUserId) {
+        // sesi polling sudah tidak ada (mis. dibayar saat bot restart) -> hapus QR lewat id tersimpan
+        await bot.telegram.deleteMessage(order.customerInfo.telegramUserId, order.qrMsgId).catch(() => {});
     }
 
     await Product.updateOne(
@@ -2285,8 +2434,193 @@ async function fulfillPakasirPaidOrder(orderId) {
     );
     await User.updateOne({ id: order.customerInfo.telegramUserId }, { $inc: { totalSpent: order.amount } });
 
+    // Kirim akun via helper tahan-banting (fallback teks biasa + lapor owner bila gagal).
     await deliverAccountsToCustomer(order, 'QRIS');
     return { ok: true };
+}
+
+// =================================================================
+// PEMBAYARAN TELAT / RESTART (Pakasir)
+// QRIS Pakasir v2 tetap bisa dibayar sampai ±24 jam walau invoice di bot sudah
+// "kedaluwarsa" 5 menit / dibatalkan pembeli. Supaya uang pembeli tidak hilang:
+//   * sebelum order dibatalkan/kedaluwarsa, status dicek dulu ke Pakasir;
+//   * sweepPakasirOrders() tiap 2 menit mengecek ulang order Pakasir 24 jam
+//     terakhir (PENDING/EXPIRED/CANCELLED/FAILED) — juga menutup celah restart;
+//   * order yang ternyata dibayar telat -> akun dikirim OTOMATIS
+//     (akun lama bila masih ada di stok, kalau tidak ambil akun baru);
+//     kalau stok habis -> owner & pembeli diberi tahu (kirim manual).
+// =================================================================
+async function pakasirStatusOf(txnId) {
+    if (!txnId) return null;
+    try {
+        const res = await pakasir.checkPaymentStatus(txnId);
+        const s = String((res && res.status) || '').toLowerCase();
+        return s || null; // null = gagal cek (jaringan / rate limit)
+    } catch (e) {
+        return null;
+    }
+}
+
+// PENDING -> EXPIRED secara atomik, BARU stok dikembalikan (tidak mungkin dobel).
+async function expirePakasirOrder(orderId) {
+    const order = await Order.findOneAndUpdate(
+        { orderId, status: 'PENDING' },
+        { $set: { status: 'EXPIRED' } },
+        { new: true }
+    );
+    if (!order) return false;
+    if (order.qrMsgId && order.customerInfo && order.customerInfo.telegramUserId) {
+        await bot.telegram.deleteMessage(order.customerInfo.telegramUserId, order.qrMsgId).catch(() => {});
+    }
+    if (order.reservedItems && order.reservedItems.length > 0) {
+        await Product.updateOne(
+            { id: order.productId, 'variants.slug': order.variantSlug },
+            {
+                $push: { 'variants.$.stock': { $each: order.reservedItems } },
+                $pull: { 'variants.$.reserved_stock': { $in: order.reservedItems } }
+            }
+        ).catch((e) => console.error(`[PAKASIR] gagal kembalikan stok ${orderId}:`, e.message));
+    }
+    return true;
+}
+
+// Ambil `qty` akun baru dari depan stok (transaksi) untuk pembayaran telat.
+async function takeFreshItems(productId, variantSlug, qty) {
+    const session = await mongoose.startSession();
+    let picked = null;
+    try {
+        await session.withTransaction(async () => {
+            picked = null;
+            const product = await Product.findOne({ id: productId }).session(session);
+            const variant = product && product.variants.find((v) => v.slug === variantSlug);
+            if (!variant || !Array.isArray(variant.stock) || variant.stock.length < qty) return;
+            picked = variant.stock.slice(0, qty);
+            variant.stock.splice(0, qty);
+            await product.save({ session });
+        });
+        return picked;
+    } catch (e) {
+        console.error('[PAKASIR] takeFreshItems error:', e.message);
+        return null;
+    } finally {
+        session.endSession();
+    }
+}
+
+async function fulfillLatePakasirOrder(orderId) {
+    // Klaim atomik: hanya satu proses (polling/webhook/sweeper) yang menangani.
+    // reservedItems langsung dikosongkan saat klaim: akun lama mungkin sudah terjual ke orang
+    // lain, jadi /resend tidak boleh mengirimnya. Akun yang benar diisi lagi di bawah.
+    const order = await Order.findOneAndUpdate(
+        { orderId, paymentGateway: 'pakasir', status: { $in: ['EXPIRED', 'CANCELLED', 'FAILED'] } },
+        { $set: { status: 'PAID', paidAt: new Date(), latePaid: true, reservedItems: [] }, $unset: { expiresAt: '' } },
+        { new: false } // dokumen SEBELUM diubah -> masih berisi daftar akun lama
+    );
+    if (!order) return { ok: false, reason: 'not_late' };
+    order.status = 'PAID';
+    order.latePaid = true;
+
+    const oldItems = Array.isArray(order.reservedItems) ? order.reservedItems.slice() : [];
+    const qty = order.quantity || oldItems.length || 1;
+    const buyer = order.customerInfo && order.customerInfo.telegramUserId;
+    let items = null;
+    // 1) Akun yang dulu direservasi masih ada di stok? -> ambil kembali persis akun itu.
+    if (oldItems.length > 0) {
+        const r = await Product.updateOne(
+            { id: order.productId, variants: { $elemMatch: { slug: order.variantSlug, stock: { $all: oldItems } } } },
+            { $pull: { 'variants.$.stock': { $in: oldItems } } }
+        ).catch(() => null);
+        if (r && r.modifiedCount === 1) items = oldItems;
+    }
+    // 2) Kalau sudah terjual ke orang lain -> ambil akun baru dari stok.
+    if (!items) items = await takeFreshItems(order.productId, order.variantSlug, qty);
+
+    const label = `${order.productName || '-'}${order.variantName ? ' - ' + order.variantName : ''}`;
+    if (!items) {
+        // Stok habis: order tetap LUNAS tapi belum terkirim -> muncul di /belumkirim
+        // (setelah dikirim manual, tandai dengan /tandaikirim <ID order>).
+        for (const id of ownerIdList()) {
+            await bot.telegram.sendMessage(id,
+                `💰⚠️ PEMBAYARAN TELAT DITERIMA — STOK HABIS\n\nOrder: ${orderId}\nUser: ${buyer || '-'}\nProduk: ${label} x${qty}\n` +
+                `Dibayar: Rp ${Number(order.totalPaid || order.amount || 0).toLocaleString('id-ID')}\n\n` +
+                'Pembeli membayar setelah invoice kedaluwarsa/dibatalkan, tetapi stok sudah habis. Kirim akun manual atau refund, lalu /tandaikirim ' + orderId
+            ).catch(() => {});
+        }
+        if (buyer) {
+            await bot.telegram.sendMessage(buyer,
+                `✅ Pembayaran Anda untuk order ${orderId} sudah kami terima.\n\n` +
+                'Stok untuk pesanan ini sedang kosong, admin akan segera mengirim akun Anda secara manual atau menghubungi Anda. Mohon ditunggu 🙏'
+            ).catch(() => {});
+        }
+        return { ok: false, reason: 'no_stock' };
+    }
+
+    await Order.updateOne({ _id: order._id }, { $set: { reservedItems: items } });
+    order.reservedItems = items;
+    await User.updateOne({ id: buyer }, { $inc: { totalSpent: order.amount } }).catch(() => {});
+    for (const id of ownerIdList()) {
+        await bot.telegram.sendMessage(id,
+            `💰 Pembayaran TELAT diterima untuk order ${orderId} (${label} x${qty}). Akun dikirim otomatis ke pembeli.`
+        ).catch(() => {});
+    }
+    await deliverAccountsToCustomer(order, 'QRIS');
+    return { ok: true };
+}
+
+// Cek ulang berkala order Pakasir 24 jam terakhir.
+// Umur < 1 jam dicek tiap ±2 menit, sisanya tiap ±15 menit (hemat request).
+let pakasirSweeping = false;
+async function sweepPakasirOrders() {
+    if (pakasirSweeping) return;
+    pakasirSweeping = true;
+    try {
+        const now = Date.now();
+        const candidates = await Order.find({
+            paymentGateway: 'pakasir',
+            pakasirTxnId: { $exists: true, $ne: null },
+            status: { $in: ['PENDING', 'EXPIRED', 'CANCELLED', 'FAILED'] },
+            pakasirFinal: { $ne: true },
+            createdAt: { $gte: new Date(now - 25 * 60 * 60 * 1000) },
+        }).sort({ pakasirCheckedAt: 1 }).limit(80).lean();
+
+        let checks = 0;
+        for (const o of candidates) {
+            if (paymentSessions.has(o.orderId)) continue; // masih dipantau polling aktif
+            const age = now - new Date(o.createdAt).getTime();
+            const every = age < 60 * 60 * 1000 ? 2 * 60 * 1000 : 15 * 60 * 1000;
+            if (o.pakasirCheckedAt && now - new Date(o.pakasirCheckedAt).getTime() < every - 5000) continue;
+            if (checks >= 25) break;
+            checks += 1;
+
+            const st = await pakasirStatusOf(o.pakasirTxnId);
+            if (st) await Order.updateOne({ _id: o._id }, { $set: { pakasirCheckedAt: new Date() } }).catch(() => {});
+            try {
+                if (st === 'completed') {
+                    if (o.status === 'PENDING') {
+                        const r = await fulfillPakasirPaidOrder(o.orderId);
+                        if (!r.ok && r.reason === 'not_pending') await fulfillLatePakasirOrder(o.orderId);
+                    } else {
+                        await fulfillLatePakasirOrder(o.orderId);
+                    }
+                    console.log(`[PAKASIR SWEEP] ${o.orderId} ternyata sudah dibayar -> diproses.`);
+                } else if (st === 'canceled' || st === 'cancelled' || st === 'expired' || st === 'failed') {
+                    await Order.updateOne({ _id: o._id }, { $set: { pakasirFinal: true } }).catch(() => {});
+                    if (o.status === 'PENDING') await expirePakasirOrder(o.orderId);
+                } else if (st === 'pending' && o.status === 'PENDING' && age > 15 * 60 * 1000) {
+                    // Tidak ada polling aktif (mis. bot restart) & belum dibayar -> kembalikan stok.
+                    // Order tetap dipantau: kalau dibayar telat, akun tetap dikirim.
+                    await expirePakasirOrder(o.orderId);
+                }
+            } catch (e) {
+                console.error(`[PAKASIR SWEEP] ${o.orderId} error:`, e.message);
+            }
+            await new Promise((r) => setTimeout(r, 400));
+        }
+    } catch (e) {
+        console.error('[PAKASIR SWEEP] Error:', e.message);
+    } finally {
+        pakasirSweeping = false;
+    }
 }
 
 // Rekonsiliasi saat startup: kalau bot mati SETELAH customer bayar tapi SEBELUM
@@ -2324,8 +2658,18 @@ async function reconcilePakasirPendingOrders() {
 // Handler pembatalan pembayaran Pakasir (QRIS ALL). Didaftarkan sebelum handler generic.
 bot.action(/^cancel_payment_pakasir_(.*)$/, async (ctx) => {
     try {
-        await ctx.answerCbQuery();
+        await ctx.answerCbQuery().catch(() => {});
         const orderId = ctx.match[1];
+        // Cek dulu ke Pakasir: kalau ternyata SUDAH dibayar, pesanan tidak dibatalkan.
+        const existing = await Order.findOne({ orderId }).lean();
+        if (existing && existing.status === 'PENDING' && existing.pakasirTxnId
+            && await pakasirStatusOf(existing.pakasirTxnId) === 'completed') {
+            const r = await fulfillPakasirPaidOrder(orderId);
+            if (r.ok || r.reason === 'already_paid') {
+                await ctx.reply('✅ Pembayaran Anda sudah kami terima, jadi pesanan tidak dibatalkan. Akun dikirim di chat ini.').catch(() => {});
+                return;
+            }
+        }
         const paymentSession = paymentSessions.get(orderId);
         if (paymentSession) {
             clearInterval(paymentSession.pollingId);
@@ -2341,7 +2685,7 @@ bot.action(/^cancel_payment_pakasir_(.*)$/, async (ctx) => {
             const order = await Order.findOneAndUpdate({ orderId: orderId, status: 'PENDING' }, { $set: { status: 'CANCELLED', cancelledAt: new Date() } }, { new: true, session: session });
             if (!order) {
                 await ctx.reply('Pesanan tidak ditemukan atau sudah diproses.');
-                await session.abortTransaction();
+                await session.abortTransaction().catch(() => {});
                 session.endSession();
                 return;
             }
@@ -2349,9 +2693,9 @@ bot.action(/^cancel_payment_pakasir_(.*)$/, async (ctx) => {
                 await Product.updateOne({ id: order.productId, "variants.slug": order.variantSlug }, { $push: { "variants.$.stock": { $each: order.reservedItems } }, $pull: { "variants.$.reserved_stock": { $in: order.reservedItems } } }).session(session);
             }
             await session.commitTransaction();
-            await ctx.reply('❌ Pesanan QRIS Anda telah berhasil dibatalkan.');
+            await ctx.reply('❌ Pesanan QRIS Anda telah berhasil dibatalkan.\nMohon JANGAN membayar QRIS yang sudah dibatalkan.').catch(() => {});
         } catch (dbError) {
-            await session.abortTransaction();
+            await session.abortTransaction().catch(() => {});
             console.error('Database error during Pakasir cancellation:', dbError);
             await ctx.reply('❌ Terjadi kesalahan internal saat membatalkan pesanan.');
         } finally {
@@ -2366,7 +2710,7 @@ bot.action(/^cancel_payment_pakasir_(.*)$/, async (ctx) => {
 // ===== Pemenuhan order yang sudah dibayar (dipanggil oleh webhook QRIN — legacy) =====
 async function fulfillQrinPaidOrder(orderId) {
     const order = await Order.findOneAndUpdate(
-        { orderId: orderId, status: 'PENDING' },
+        { orderId: orderId, status: 'PENDING', paymentGateway: 'qrin' }, // hanya order QRIN
         { $set: { status: 'PAID', paidAt: new Date() }, $unset: { expiresAt: "" } },
         { new: true }
     );
@@ -2418,9 +2762,8 @@ app.post(['/callback', '/qrin/callback'], async (req, res) => {
         if (status === 'success') {
             const result = await fulfillQrinPaidOrder(orderId);
             if (!result.ok && result.reason === 'not_pending') {
-                const ownerId = process.env.OWNER_ID;
-                if (ownerId) {
-                    await bot.telegram.sendMessage(ownerId, `⚠️ [QRIN] Pembayaran diterima untuk order \`${orderId}\` tetapi status order bukan PENDING. Perlu cek manual.`, { parse_mode: 'Markdown' }).catch(() => {});
+                for (const ownerId of ownerIdList()) {
+                    await bot.telegram.sendMessage(ownerId, `⚠️ [QRIN] Pembayaran diterima untuk order ${orderId} tetapi status order bukan PENDING. Perlu cek manual.`).catch(() => {});
                 }
             }
         }
@@ -3252,9 +3595,21 @@ bot.hears(/^[^\/]/, async (ctx) => {
 });
 
 bot.catch((err, ctx) => {
-    console.error(`Error for user ${ctx.from?.id}:`, err);
+    const desc = String((err && (err.description || err.message)) || err || '');
+    console.error(`[bot.catch] type=${ctx && ctx.updateType} user=${ctx && ctx.from && ctx.from.id}: ${desc}`);
+    // Error Telegram berikut bukan kegagalan nyata (tombol lama, pesan sudah dihapus,
+    // isi pesan sama, user memblokir bot) -> jangan tampilkan "kesalahan internal".
+    const benign = [
+        'message is not modified', 'query is too old', 'query ID is invalid',
+        'message to edit not found', 'message to delete not found', "message can't be deleted",
+        'MESSAGE_ID_INVALID', 'message to be replied not found', 'bot was blocked by the user',
+        'user is deactivated', 'chat not found', 'Forbidden', "can't parse entities",
+    ];
+    if (benign.some((s) => desc.includes(s))) return;
     try {
-        ctx.reply('❌ Maaf, terjadi kesalahan internal. Silakan coba lagi nanti.');
+        if (ctx && typeof ctx.reply === 'function') {
+            ctx.reply('❌ Maaf, terjadi kesalahan internal. Silakan coba lagi nanti.').catch(() => {});
+        }
     } catch (e) {
         console.error("Fatal error: Can't send error message to user.", e);
     }
@@ -3315,13 +3670,26 @@ bot.command('belumkirim', async (ctx) => {
         const lines = [`⚠️ *${orders.length} order sudah dibayar tapi akun belum terkirim:*`, ''];
         orders.forEach((o, i) => {
             const when = o.paidAt ? moment(o.paidAt).tz('Asia/Jakarta').format('DD/MM HH:mm') : '-';
-            lines.push(`${i + 1}. \`${o.orderId}\`\n   ${o.productName} - ${o.variantName} (${o.quantity}x) • user ${o.customerInfo?.telegramUserId} • ${when}`);
+            const kosong = !o.reservedItems || o.reservedItems.length === 0 ? ' • ⚠️ akun belum ada (kirim manual)' : '';
+            lines.push(`${i + 1}. \`${o.orderId}\`\n   ${escapeMd(o.productName)} - ${escapeMd(o.variantName)} (${o.quantity}x) • user ${o.customerInfo?.telegramUserId} • ${when}${kosong}`);
         });
-        lines.push('', 'Kirim ulang: `/resend <ID_ORDER>`');
-        await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
+        lines.push('', 'Kirim ulang dengan: `/resend <ID_ORDER>`', 'Sudah dikirim manual? Tandai: `/tandaikirim <ID_ORDER>`');
+        const text = lines.join('\n');
+        await ctx.reply(text, { parse_mode: 'Markdown' })
+            .catch(() => ctx.reply(text.replace(/\\([_*`\[])/g, '$1').replace(/[*`]/g, '')));
     } catch (err) { await ctx.reply(`❌ Gagal: ${err.message}`); }
 });
 
+// Tandai order sudah terkirim (mis. akun dikirim manual oleh owner). Khusus owner.
+bot.command('tandaikirim', async (ctx) => {
+    if (!ownerIdList().includes(String(ctx.from.id))) return;
+    const orderId = ctx.message.text.replace(/^\/tandaikirim(@\w+)?\s*/i, '').trim();
+    if (!orderId) return ctx.reply('Format: /tandaikirim <ID_ORDER>\nLihat daftar dengan /belumkirim');
+    const r = await Order.updateOne({ orderId, status: 'PAID' }, { $set: { delivered: true, deliveredAt: new Date() } });
+    return ctx.reply(r.matchedCount ? `✅ Order ${orderId} ditandai sudah terkirim.` : `❌ Order ${orderId} tidak ditemukan / belum lunas.`);
+});
+
+// Kirim ulang akun ke customer untuk order tertentu (khusus owner).
 bot.command('resend', async (ctx) => {
     const ADMIN_IDS = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
     if (!ADMIN_IDS.includes(String(ctx.from.id))) return;
@@ -3332,7 +3700,7 @@ bot.command('resend', async (ctx) => {
         if (!order) return ctx.reply('❌ Order tidak ditemukan.');
         if (order.status !== 'PAID') return ctx.reply(`❌ Status order = ${order.status} (bukan PAID).`);
         if (!order.reservedItems || order.reservedItems.length === 0) return ctx.reply('❌ Data akun order ini sudah kosong (lewat masa retensi).');
-        const ok = await deliverAccountsToCustomer(order, (order.paymentGateway || 'QRIS').toUpperCase());
+        const ok = await deliverAccountsToCustomer(order, String(order.paymentGateway || '').toLowerCase() === 'dana' ? 'DANA' : 'QRIS');
         await ctx.reply(ok ? `✅ Akun order \`${orderId}\` berhasil dikirim ulang.` : `❌ Masih gagal kirim untuk \`${orderId}\`. Cek apakah bot diblokir user.`, { parse_mode: 'Markdown' });
     } catch (err) { await ctx.reply(`❌ Gagal: ${err.message}`); }
 });
@@ -3374,7 +3742,19 @@ setTimeout(() => docheck.runDigitalOceanCheck(bot), 60 * 1000);
 setInterval(() => docheck.runDigitalOceanCheck(bot), docheck.CHECK_INTERVAL_MS);
 
 // Rekonsiliasi order Pakasir yang mungkin dibayar saat bot mati (ditunda 20 detik).
-setTimeout(reconcilePakasirPendingOrders, 20 * 1000);
+setTimeout(sweepPakasirOrders, 20 * 1000);
+if (ADMIN_DEFAULT_LOGIN) {
+    setTimeout(() => {
+        for (const id of ownerIdList()) {
+            bot.telegram.sendMessage(id,
+                '⚠️ Login panel web masih memakai gen/gen (tidak aman).\n' +
+                'Isi ADMIN_USERNAME dan ADMIN_PASSWORD di Environment Render, lalu deploy ulang.'
+            ).catch(() => {});
+        }
+    }, 25 * 1000);
+}
+// Cek ulang berkala: pembayaran telat / setelah restart tetap diproses.
+setInterval(sweepPakasirOrders, 2 * 60 * 1000);
 
 // Jaring pengaman: error tak tertangkap tidak mematikan seluruh bot, cukup dilaporkan.
 process.on('unhandledRejection', (reason) => {
