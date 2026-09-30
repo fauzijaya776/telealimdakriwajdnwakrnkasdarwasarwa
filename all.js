@@ -54,6 +54,13 @@ const testimoni = createTestimoni({
         for (const id of owners) await bot.telegram.sendMessage(id, text).catch(() => {});
     },
 });
+// Daftar pembeli DigitalOcean + template "bot pindah" (panel web /pembeli-do & panel admin Telegram).
+const createPembeliDo = require('./pembelido');
+const pembeliDo = createPembeliDo({
+    Order, Product, User, Settings,
+    storeName: 'ALIM STORE',
+    channel: process.env.TESTI_CHANNEL && !/^off$/i.test(process.env.TESTI_CHANNEL) ? process.env.TESTI_CHANNEL : '@testiAlimStore',
+});
 // === 2. INISIALISASI & KONEKSI DATABASE ===
 connectDB(); 
 
@@ -951,6 +958,9 @@ app.post('/assets/replace', authMiddleware, (req, res) => {
     });
 });
 
+// Halaman "Pembeli DO": daftar pembeli DigitalOcean + template pindah bot.
+pembeliDo.registerRoutes(app, authMiddleware, ejs, path, path.join(__dirname, 'views'));
+
 app.get('/payment-gateways', authMiddleware, async (req, res) => {
     try {
         let settings = await Settings.findOneAndUpdate(
@@ -1004,6 +1014,16 @@ app.get('/api-docs', authMiddleware, async (req, res) => {
 // =================================================================
 // BAGIAN B: KODE TELEGRAM BOT (DARI bot.js)
 // =================================================================
+
+// Wajib join channel testimoni sebelum memakai bot (owner dikecualikan).
+// Bot harus ADMIN di channel. Atur lewat env FORCE_JOIN_CHANNEL (isi "off" untuk mematikan).
+const createForceJoin = require('./forcejoin');
+createForceJoin({
+    channel: process.env.TESTI_CHANNEL !== undefined ? process.env.TESTI_CHANNEL : '@testiAlimStore',
+    storeName: 'ALIM STORE',
+}).attach(bot);
+
+pembeliDo.attach(bot);
 
 adminModule(bot);
 

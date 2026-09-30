@@ -99,6 +99,7 @@ async function getAdminMenuMessageAndKeyboard() {
     [Markup.button.callback('📜 Kelola SNK', 'admin_snk_select_product_1')],
     [Markup.button.callback('❌ Hapus Produk', 'admin_delete_product_list_1')],
     [Markup.button.callback('🚀 Broadcast', 'admin_broadcast')],
+    [Markup.button.callback('📋 Pembeli DigitalOcean', 'admin_do_buyers')],
     [Markup.button.callback('💳 Buat Transfer', 'admin_tf')],
     [Markup.button.callback('🧾 Cek Saldo', 'admin_profile')],
     [Markup.button.callback(testiSilent ? '🔕 Testimoni Senyap: ON' : '🔔 Testimoni Senyap: OFF', 'admin_testi_silent')],

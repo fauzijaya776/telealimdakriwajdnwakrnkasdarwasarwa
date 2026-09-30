@@ -37,6 +37,8 @@ const ProductSchema = new mongoose.Schema({
 const UserSchema = new mongoose.Schema({
     id: { type: String, unique: true, required: true },
     username: String,
+    // Kapan owner menandai user ini "sudah dihubungi" soal pindah bot (menu Pembeli DO).
+    movedNotifiedAt: Date,
     balance: { type: Number, default: 0 },
     totalSpent: { type: Number, default: 0 }
 });
@@ -98,6 +100,8 @@ const SettingsSchema = new mongoose.Schema({
     tokopay_enabled: { type: Boolean, default: true },
     // Testimoni channel dikirim tanpa bunyi (default ON). Diubah lewat Admin Panel Telegram.
     testi_silent: { type: Boolean, default: true },
+    // Template pesan "bot pindah" (menu Pembeli DO). Kosong = pakai template bawaan.
+    move_template: String,
 });
 
 // =============================================================

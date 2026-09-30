@@ -1,0 +1,165 @@
+<div class="max-w-6xl">
+    <!-- Ringkasan -->
+    <div class="bg-white rounded-xl shadow p-6 mb-6">
+        <h2 class="text-lg font-bold text-gray-800 mb-1">Pembeli DigitalOcean — <%= storeName %></h2>
+        <p class="text-sm text-gray-500 mb-4">
+            Bot lama tidak bisa mengirim pesan lagi, dan bot baru hanya bisa menghubungi orang yang sudah /start di bot baru.
+            Hubungi pembeli lama <b>manual</b> dari akun Telegram pribadi: tekan <b>💬 Chat</b> (template otomatis tersalin),
+            tempel &amp; kirim, lalu tekan <b>✔ Sudah</b>.
+        </p>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+            <div class="rounded-lg border border-gray-100 p-4 text-center">
+                <div class="text-2xl font-bold text-gray-800"><%= stats.total %></div>
+                <div class="text-xs text-gray-500 mt-1">Total pembeli</div>
+            </div>
+            <div class="rounded-lg border border-purple-100 bg-purple-50 p-4 text-center">
+                <div class="text-2xl font-bold text-purple-700"><%= stats.withUsername %></div>
+                <div class="text-xs text-purple-700 mt-1">Punya @username</div>
+            </div>
+            <div class="rounded-lg border border-green-100 bg-green-50 p-4 text-center">
+                <div id="cDone" class="text-2xl font-bold text-green-700"><%= stats.contacted %></div>
+                <div class="text-xs text-green-700 mt-1">Sudah dihubungi</div>
+            </div>
+            <div class="rounded-lg border border-amber-100 bg-amber-50 p-4 text-center">
+                <div class="text-2xl font-bold text-amber-700"><%= stats.noUsername %></div>
+                <div class="text-xs text-amber-700 mt-1">Tanpa username</div>
+            </div>
+        </div>
+        <div class="mt-4 rounded-lg bg-amber-50 border border-amber-200 text-amber-800 text-xs p-3">
+            ⚠️ Kirim bertahap, maksimal ±20–30 orang per hari dan beri jeda antar-pesan. Telegram cepat membatasi akun
+            pribadi yang mengirim pesan ke banyak orang yang bukan kontak. Pembeli tanpa username hanya bisa dijangkau
+            lewat pengumuman di channel.
+        </div>
+    </div>
+
+    <!-- Template -->
+    <div class="bg-white rounded-xl shadow p-6 mb-6">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+            <h3 class="text-sm font-semibold text-gray-700">Template pesan pindah bot</h3>
+            <div class="flex gap-2">
+                <button type="button" onclick="copyTpl(this)" class="bg-purple-700 hover:bg-purple-800 text-white text-sm font-semibold py-2 px-4 rounded-lg">📋 Salin template</button>
+                <a href="/pembeli-do/unduh?format=txt" class="bg-gray-100 hover:bg-gray-200 text-gray-800 text-sm font-semibold py-2 px-4 rounded-lg">⬇ Unduh .txt</a>
+                <a href="/pembeli-do/unduh?format=csv" class="bg-gray-100 hover:bg-gray-200 text-gray-800 text-sm font-semibold py-2 px-4 rounded-lg">⬇ Unduh .csv</a>
+            </div>
+        </div>
+        <% if (saved) { %><p class="text-xs text-green-700 mb-2">✅ Template disimpan.</p><% } %>
+        <p class="text-xs text-gray-500 mb-1">Pratinjau (yang tersalin):</p>
+        <pre id="tplPreview" class="whitespace-pre-wrap text-sm bg-gray-50 border rounded-lg p-3 mb-4"><%= template %></pre>
+        <details>
+            <summary class="text-sm text-purple-700 cursor-pointer">✏️ Ubah template</summary>
+            <form method="POST" action="/pembeli-do/template" class="mt-3">
+                <p class="text-xs text-gray-500 mb-2">Kode otomatis: <code>{TOKO}</code> = nama toko, <code>{BOT}</code> = @username bot baru, <code>{CHANNEL}</code> = channel testimoni.</p>
+                <textarea name="template" rows="8" class="w-full border rounded-lg p-3 text-sm font-mono"><%= rawTemplate %></textarea>
+                <div class="flex gap-2 mt-2">
+                    <button type="submit" class="bg-purple-700 hover:bg-purple-800 text-white text-sm font-semibold py-2 px-4 rounded-lg">Simpan</button>
+                    <% if (!isDefaultTemplate) { %>
+                    <button type="submit" name="reset" value="1" class="bg-gray-100 hover:bg-gray-200 text-gray-800 text-sm font-semibold py-2 px-4 rounded-lg">Kembalikan bawaan</button>
+                    <% } %>
+                </div>
+            </form>
+        </details>
+    </div>
+
+    <!-- Daftar -->
+    <div class="bg-white rounded-xl shadow p-6">
+        <div class="flex flex-wrap items-center gap-2 mb-4 text-sm">
+            <span class="text-gray-500">Tampilkan:</span>
+            <a href="/pembeli-do?f=belum" class="px-3 py-1 rounded-full <%= filter === 'belum' ? 'bg-purple-700 text-white' : 'bg-gray-100 text-gray-700' %>">Belum dihubungi</a>
+            <a href="/pembeli-do?f=semua" class="px-3 py-1 rounded-full <%= filter === 'semua' ? 'bg-purple-700 text-white' : 'bg-gray-100 text-gray-700' %>">Semua</a>
+            <a href="/pembeli-do?f=nouser" class="px-3 py-1 rounded-full <%= filter === 'nouser' ? 'bg-purple-700 text-white' : 'bg-gray-100 text-gray-700' %>">Tanpa username</a>
+            <span class="text-gray-400 ml-auto"><%= buyers.length %> baris</span>
+        </div>
+        <% if (!buyers.length) { %>
+            <p class="text-sm text-gray-500 py-6 text-center">
+                <%= filter === 'belum' ? '🎉 Semua pembeli yang punya username sudah dihubungi.' : 'Tidak ada data.' %>
+            </p>
+        <% } else { %>
+        <div class="overflow-x-auto">
+            <table class="min-w-full text-sm">
+                <thead>
+                    <tr class="text-left text-xs text-gray-500 border-b">
+                        <th class="py-2 pr-3">No</th>
+                        <th class="py-2 pr-3">Nama</th>
+                        <th class="py-2 pr-3">Username</th>
+                        <th class="py-2 pr-3">User ID</th>
+                        <th class="py-2 pr-3">Order terakhir</th>
+                        <th class="py-2 pr-3">Jml</th>
+                        <th class="py-2">Aksi</th>
+                    </tr>
+                </thead>
+                <tbody>
+                <% buyers.forEach(function (b, i) { %>
+                    <tr class="border-b last:border-0" id="row-<%= b.userId %>">
+                        <td class="py-2 pr-3 text-gray-400"><%= i + 1 %></td>
+                        <td class="py-2 pr-3"><%= b.name %></td>
+                        <td class="py-2 pr-3"><%= b.username ? '@' + b.username : '—' %></td>
+                        <td class="py-2 pr-3 font-mono text-xs"><%= b.userId %></td>
+                        <td class="py-2 pr-3 whitespace-nowrap"><%= b.lastPaidText %></td>
+                        <td class="py-2 pr-3"><%= b.orders %></td>
+                        <td class="py-2 whitespace-nowrap">
+                            <% if (b.username) { %>
+                                <a href="https://t.me/<%= b.username %>" target="_blank" rel="noopener noreferrer" onclick="copyTpl()"
+                                   class="inline-block bg-sky-500 hover:bg-sky-600 text-white text-xs font-semibold py-1.5 px-3 rounded-lg">💬 Chat</a>
+                                <button type="button" data-uid="<%= b.userId %>" data-done="<%= b.contactedAt ? '1' : '0' %>" onclick="toggleDone(this)"
+                                   class="text-xs font-semibold py-1.5 px-3 rounded-lg <%= b.contactedAt ? 'bg-green-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200' %>">
+                                    <%= b.contactedAt ? '✔ Sudah' : 'Tandai sudah' %>
+                                </button>
+                            <% } else { %>
+                                <span class="text-xs text-gray-400">tidak bisa dichat</span>
+                            <% } %>
+                        </td>
+                    </tr>
+                <% }) %>
+                </tbody>
+            </table>
+        </div>
+        <% } %>
+    </div>
+</div>
+
+<div id="toast" class="hidden fixed bottom-6 right-6 bg-gray-900 text-white text-sm px-4 py-2 rounded-lg shadow-lg"></div>
+
+<script>
+    function toast(msg) {
+        var t = document.getElementById('toast');
+        t.textContent = msg;
+        t.classList.remove('hidden');
+        clearTimeout(window.__toastTimer);
+        window.__toastTimer = setTimeout(function () { t.classList.add('hidden'); }, 2200);
+    }
+    function copyTpl() {
+        var text = document.getElementById('tplPreview').textContent;
+        function fallback() {
+            var ta = document.createElement('textarea');
+            ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+            document.body.appendChild(ta); ta.select();
+            try { document.execCommand('copy'); toast('📋 Template disalin — tinggal tempel di chat'); }
+            catch (e) { toast('Gagal menyalin, salin manual dari pratinjau'); }
+            document.body.removeChild(ta);
+        }
+        if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(text).then(function () { toast('📋 Template disalin — tinggal tempel di chat'); }, fallback);
+        } else {
+            fallback();
+        }
+    }
+    function toggleDone(btn) {
+        var uid = btn.getAttribute('data-uid');
+        var next = btn.getAttribute('data-done') !== '1';
+        btn.disabled = true;
+        fetch('/pembeli-do/tandai', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: uid, done: next })
+        }).then(function (r) { return r.json(); }).then(function (res) {
+            btn.disabled = false;
+            if (!res.ok) { toast('Gagal menyimpan (user tidak ditemukan)'); return; }
+            btn.setAttribute('data-done', next ? '1' : '0');
+            btn.textContent = next ? '✔ Sudah' : 'Tandai sudah';
+            btn.className = 'text-xs font-semibold py-1.5 px-3 rounded-lg ' + (next ? 'bg-green-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200');
+            var c = document.getElementById('cDone');
+            c.textContent = String(Math.max(0, parseInt(c.textContent, 10) + (next ? 1 : -1)));
+            toast(next ? '✔ Ditandai sudah dihubungi' : 'Tanda dihapus');
+        }).catch(function () { btn.disabled = false; toast('Gagal menyimpan, coba lagi'); });
+    }
+</script>
