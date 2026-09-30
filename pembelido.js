@@ -257,35 +257,137 @@ module.exports = function createPembeliDo(cfg) {
     }
 
     // ---------------- panel admin Telegram ----------------
+    // Daftar pembeli langsung di chat, per halaman. Tiap pembeli punya tombol
+    // "💬 Nama" yang membuka chat ke @username DENGAN template sudah terisi
+    // (link t.me/<username>?text=..., didukung Telegram versi terbaru), dan
+    // tombol "✔" untuk menandai sudah dihubungi.
+    const PAGE_SIZE = 8;
+
+    function escHtml(s) {
+        return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // filter: 'b' = belum dihubungi (punya username), 's' = semua yang punya username
+    async function buildPage(filter, page, withText) {
+        const all = await getBuyers();
+        const s = summarize(all);
+        const list = all.filter((b) => b.username && (filter === 's' || !b.contactedAt));
+        const pages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
+        const pg = Math.min(Math.max(0, page | 0), pages - 1);
+        const slice = list.slice(pg * PAGE_SIZE, pg * PAGE_SIZE + PAGE_SIZE);
+        const template = await renderTemplate(await getRawTemplate());
+        const enc = encodeURIComponent(template);
+
+        const lines = [
+            `📋 <b>Pembeli DigitalOcean — ${escHtml(storeName)}</b>`,
+            `Total ${s.total} • punya username ${s.withUsername} • sudah dihubungi ${s.contacted} • tanpa username ${s.noUsername}`,
+            `Tampil: <b>${filter === 's' ? 'semua' : 'belum dihubungi'}</b> — halaman ${pg + 1}/${pages}`,
+            '',
+        ];
+        if (!slice.length) {
+            lines.push(filter === 's' ? 'Belum ada pembeli yang punya username.' : '🎉 Semua pembeli yang punya username sudah dihubungi.');
+        } else {
+            slice.forEach((b, i) => {
+                lines.push(`${pg * PAGE_SIZE + i + 1}. ${escHtml(b.name)} — @${b.username} • ${b.orders} order • ${escHtml(b.lastPaidText)}${b.contactedAt ? ' ✅' : ''}`);
+            });
+            lines.push('', withText
+                ? '👉 Tekan tombol <b>💬 nama</b>: chat terbuka dan template sudah terisi, tinggal kirim. Lalu tekan <b>✔</b>.'
+                : '👉 Tekan tombol <b>💬 nama</b> untuk membuka chat, tempel template (tombol 📋 Template), kirim, lalu tekan <b>✔</b>.');
+            lines.push('<i>Kirim bertahap ±20–30 orang/hari supaya akun pribadi tidak dibatasi Telegram.</i>');
+        }
+
+        const kb = slice.map((b) => [
+            {
+                text: `💬 ${String(b.name).slice(0, 18)} (@${b.username})`,
+                url: `https://t.me/${b.username}` + (withText ? `?text=${enc}` : ''),
+            },
+            { text: b.contactedAt ? '↩️' : '✔', callback_data: `pdo_d:${filter}:${pg}:${b.userId}` },
+        ]);
+        const nav = [];
+        if (pg > 0) nav.push({ text: '⬅️', callback_data: `pdo_p:${filter}:${pg - 1}` });
+        nav.push({ text: `${pg + 1}/${pages}`, callback_data: `pdo_p:${filter}:${pg}` });
+        if (pg < pages - 1) nav.push({ text: '➡️', callback_data: `pdo_p:${filter}:${pg + 1}` });
+        kb.push(nav);
+        kb.push([
+            { text: filter === 's' ? '👀 Belum dihubungi' : '👀 Semua', callback_data: `pdo_p:${filter === 's' ? 'b' : 's'}:0` },
+            { text: '📋 Template', callback_data: 'pdo_tpl' },
+            { text: '📄 File .txt', callback_data: 'pdo_txt' },
+        ]);
+        kb.push([{ text: '⬅️ Kembali', callback_data: 'admin_menu' }]);
+        return { text: lines.join('\n'), reply_markup: { inline_keyboard: kb } };
+    }
+
+    // Kirim/ubah halaman. Kalau Telegram menolak link panjang ber-template,
+    // otomatis pakai link biasa (template disalin manual lewat tombol 📋 Template).
+    async function showPage(ctx, filter, page, edit) {
+        const opts = (v) => ({ parse_mode: 'HTML', reply_markup: v.reply_markup, disable_web_page_preview: true });
+        const send = (v) => (edit
+            ? ctx.editMessageText(v.text, opts(v))
+            : ctx.reply(v.text, opts(v)));
+        try {
+            await send(await buildPage(filter, page, true));
+        } catch (e) {
+            const desc = String((e && (e.description || e.message)) || e);
+            if (/message is not modified/i.test(desc)) return;
+            console.warn('[PEMBELI-DO] link ber-template ditolak, pakai link biasa:', desc);
+            try {
+                await send(await buildPage(filter, page, false));
+            } catch (e2) {
+                const d2 = String((e2 && (e2.description || e2.message)) || e2);
+                if (!/message is not modified/i.test(d2)) await ctx.reply('❌ Gagal menampilkan daftar: ' + d2).catch(() => {});
+            }
+        }
+    }
+
+    function isOwnerCtx(ctx) {
+        return ownerIds().includes(String(ctx.from && ctx.from.id));
+    }
+
     function attach(b) {
         bot = b;
         bot.action('admin_do_buyers', async (ctx) => {
-            if (!ownerIds().includes(String(ctx.from.id))) return ctx.answerCbQuery('❌ Khusus admin.').catch(() => {});
+            if (!isOwnerCtx(ctx)) return ctx.answerCbQuery('❌ Khusus admin.').catch(() => {});
             await ctx.answerCbQuery('Menyiapkan daftar...').catch(() => {});
+            await showPage(ctx, 'b', 0, false);
+        });
+
+        bot.action(/^pdo_p:([bs]):(\d+)$/, async (ctx) => {
+            if (!isOwnerCtx(ctx)) return ctx.answerCbQuery('❌ Khusus admin.').catch(() => {});
+            await ctx.answerCbQuery().catch(() => {});
+            await showPage(ctx, ctx.match[1], parseInt(ctx.match[2], 10), true);
+        });
+
+        bot.action(/^pdo_d:([bs]):(\d+):(\d{3,20})$/, async (ctx) => {
+            if (!isOwnerCtx(ctx)) return ctx.answerCbQuery('❌ Khusus admin.').catch(() => {});
+            const [, filter, page, uid] = ctx.match;
+            const u = await User.findOne({ id: uid }, { movedNotifiedAt: 1 }).lean().catch(() => null);
+            const done = !(u && u.movedNotifiedAt);
+            const ok = await setContacted(uid, done).catch(() => false);
+            await ctx.answerCbQuery(ok ? (done ? '✔ Ditandai sudah dihubungi' : '↩️ Tanda dihapus') : '❌ User tidak ditemukan').catch(() => {});
+            await showPage(ctx, filter, parseInt(page, 10), true);
+        });
+
+        bot.action('pdo_tpl', async (ctx) => {
+            if (!isOwnerCtx(ctx)) return ctx.answerCbQuery('❌ Khusus admin.').catch(() => {});
+            await ctx.answerCbQuery('Ketuk teks template untuk menyalin').catch(() => {});
+            const template = await renderTemplate(await getRawTemplate());
+            // <pre> = sekali ketuk langsung tersalin di Telegram HP
+            await ctx.reply(`<pre>${escHtml(template)}</pre>`, { parse_mode: 'HTML' })
+                .catch(() => ctx.reply(template).catch(() => {}));
+        });
+
+        bot.action('pdo_txt', async (ctx) => {
+            if (!isOwnerCtx(ctx)) return ctx.answerCbQuery('❌ Khusus admin.').catch(() => {});
+            await ctx.answerCbQuery('Menyiapkan file...').catch(() => {});
             try {
                 const buyers = await getBuyers();
-                const s = summarize(buyers);
                 const template = await renderTemplate(await getRawTemplate());
-                await ctx.reply(
-                    `📋 Pembeli DigitalOcean — ${storeName}\n\n` +
-                    `Total pembeli: ${s.total}\n` +
-                    `Punya @username (bisa dichat manual): ${s.withUsername}\n` +
-                    `Tanpa username: ${s.noUsername}\n` +
-                    `Sudah dihubungi: ${s.contacted}/${s.withUsername}\n\n` +
-                    'File daftar & template pesan di bawah. Kirim manual dari akun pribadi, maksimal ±20–30 orang per hari. ' +
-                    'Tandai "sudah dihubungi" & lihat daftar lengkap di panel web: menu "Pembeli DO".'
-                ).catch(() => {});
-                if (buyers.length) {
-                    await ctx.replyWithDocument(
-                        { source: Buffer.from(toTxt(buyers, template), 'utf8'), filename: `pembeli-digitalocean-${new Date().toISOString().slice(0, 10)}.txt` },
-                        { caption: `${buyers.length} pembeli DigitalOcean` }
-                    ).catch(() => {});
-                }
-                // template dikirim sebagai pesan terpisah (teks biasa) supaya gampang disalin / diteruskan
-                await ctx.reply(template, { disable_web_page_preview: true }).catch(() => {});
+                await ctx.replyWithDocument(
+                    { source: Buffer.from(toTxt(buyers, template), 'utf8'), filename: `pembeli-digitalocean-${new Date().toISOString().slice(0, 10)}.txt` },
+                    { caption: `${buyers.length} pembeli DigitalOcean (termasuk yang tanpa username)` }
+                );
             } catch (e) {
-                console.error('[PEMBELI-DO] telegram error:', e);
-                await ctx.reply('❌ Gagal mengambil daftar pembeli: ' + e.message).catch(() => {});
+                await ctx.reply('❌ Gagal membuat file: ' + e.message).catch(() => {});
             }
         });
     }
