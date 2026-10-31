@@ -3751,6 +3751,87 @@ bot.command('resend', async (ctx) => {
 });
 
 // =================================================================
+// AUTOGOPAY LEWAT TELEGRAM (tanpa akses env hosting) — khusus owner
+//   /setagpkey agp_xxx            simpan API key (terenkripsi), hanya di chat pribadi
+//   /agpkey                       lihat status key & gateway (key tidak ditampilkan utuh)
+//   /agpgateway autogopay|pakasir|auto   pilih gateway order baru
+//   /hapusagpkey                  hapus key yang disimpan lewat Telegram
+// Env hosting (AUTOGOPAY_API_KEY / PAYMENT_PROVIDER), bila ada, tetap didahulukan.
+// =================================================================
+const qrisSettings = require('./qris_settings');
+const autogopayApi = require('./qris_autogopay');
+const isOwnerCtx = (ctx) => !!ctx.from && ownerIdList().includes(String(ctx.from.id));
+const commandArg = (ctx, cmd) => String((ctx.message && ctx.message.text) || '').replace(new RegExp(`^/${cmd}(@\\w+)?\\s*`, 'i'), '').trim();
+const fmtWib = (d) => (d ? moment(d).tz('Asia/Jakarta').format('DD/MM/YYYY HH:mm') + ' WIB' : '-');
+
+async function agpStatusText() {
+    await qrisSettings.ensureLoaded(true);
+    const key = qrisSettings.apiKey();
+    const src = qrisSettings.keySource();
+    const info = qrisSettings.info();
+    const lines = [
+        `Gateway order baru: ${qrisSettings.activeProvider() === 'autogopay' ? 'AutoGoPay' : 'Pakasir'} (diatur: ${qrisSettings.providerSource()})`,
+        `API key AutoGoPay: ${key ? `${qrisSettings.mask(key)} (dari ${src === 'env' ? 'env hosting' : 'Telegram /setagpkey'})` : 'belum ada'}`,
+    ];
+    if (src === 'telegram') lines.push(`Disimpan: ${fmtWib(info.setAt)} oleh ${info.setBy || '-'}`);
+    if (info.decryptFailed) lines.push('⚠️ Key tersimpan tidak bisa dibuka (BOT_TOKEN berubah?). Kirim ulang /setagpkey.');
+    if (key) {
+        const v = await autogopayApi.verifyKey(key);
+        lines.push(v.ok ? 'Cek ke AutoGoPay: ✅ key aktif' : `Cek ke AutoGoPay: ❌ ${v.reason}`);
+    }
+    return lines.join('\n');
+}
+
+bot.command('setagpkey', async (ctx) => {
+    // Pesan berisi key dihapus SECEPATNYA, siapa pun pengirimnya.
+    await ctx.deleteMessage().catch(() => {});
+    if (!isOwnerCtx(ctx)) return;
+    if (ctx.chat.type !== 'private') {
+        return ctx.reply('⚠️ Key dikirim di grup. Pesannya sudah dihapus, tapi anggap key itu BOCOR: buat key baru di dashboard AutoGoPay, lalu kirim lewat chat PRIBADI dengan bot.').catch(() => {});
+    }
+    const key = commandArg(ctx, 'setagpkey');
+    if (!qrisSettings.looksLikeKey(key)) {
+        return ctx.reply('Format: /setagpkey agp_xxxxxxxx\n(API key dari dashboard autogopay.site → Dokumentasi/Autentikasi). Pesanmu sudah dihapus.').catch(() => {});
+    }
+    // Verifikasi tanpa membuat QRIS (hanya membaca daftar transaksi).
+    const check = await autogopayApi.verifyKey(key);
+    if (!check.ok) return ctx.reply(`❌ Key TIDAK disimpan: ${check.reason}`).catch(() => {});
+    try {
+        await qrisSettings.saveKey(key, ctx.from.id);
+    } catch (err) {
+        return ctx.reply(`❌ Gagal menyimpan key: ${err.message}`).catch(() => {});
+    }
+    const envNote = qrisSettings.keySource() === 'env' ? '\n\nℹ️ Env AUTOGOPAY_API_KEY di hosting masih ada dan tetap dipakai lebih dulu.' : '';
+    await ctx.reply(`✅ Key AutoGoPay disimpan (terenkripsi) dan pesanmu sudah dihapus.\n\n${await agpStatusText()}${envNote}\n\nKembali ke Pakasir kapan saja: /agpgateway pakasir`).catch(() => {});
+});
+
+bot.command('agpkey', async (ctx) => {
+    if (!isOwnerCtx(ctx)) return;
+    await ctx.reply(await agpStatusText()).catch(() => {});
+});
+
+bot.command('agpgateway', async (ctx) => {
+    if (!isOwnerCtx(ctx)) return;
+    const choice = commandArg(ctx, 'agpgateway').toLowerCase();
+    if (!['autogopay', 'pakasir', 'auto'].includes(choice)) {
+        return ctx.reply('Format: /agpgateway autogopay | pakasir | auto\n(auto = AutoGoPay kalau key ada, selain itu Pakasir)').catch(() => {});
+    }
+    await qrisSettings.ensureLoaded(true);
+    if (choice === 'autogopay' && !qrisSettings.apiKey()) {
+        return ctx.reply('❌ Belum ada API key AutoGoPay. Kirim dulu /setagpkey agp_xxx (di chat pribadi).').catch(() => {});
+    }
+    await qrisSettings.setProvider(choice);
+    const envNote = qrisSettings.providerSource() === 'env' ? '\n\nℹ️ Env PAYMENT_PROVIDER di hosting masih ada dan tetap dipakai lebih dulu.' : '';
+    await ctx.reply(`✅ Pengaturan gateway disimpan. Order lama tetap dicek ke gateway pembuatnya.\n\n${await agpStatusText()}${envNote}`).catch(() => {});
+});
+
+bot.command('hapusagpkey', async (ctx) => {
+    if (!isOwnerCtx(ctx)) return;
+    await qrisSettings.clearKey();
+    await ctx.reply(`🗑️ Key AutoGoPay yang disimpan lewat Telegram sudah dihapus.\n\n${await agpStatusText()}`).catch(() => {});
+});
+
+// =================================================================
 // BAGIAN C: TITIK MULAI APLIKASI (LAUNCHER)
 // =================================================================
 

@@ -102,6 +102,12 @@ const SettingsSchema = new mongoose.Schema({
     testi_silent: { type: Boolean, default: true },
     // Template pesan "bot pindah" (menu Pembeli DO). Kosong = pakai template bawaan.
     move_template: String,
+    // AutoGoPay yang diatur owner lewat Telegram (/setagpkey, /agpgateway) — lihat qris_settings.js.
+    // Key disimpan TERENKRIPSI (AES-256-GCM, kunci turunan BOT_TOKEN), tidak pernah teks biasa.
+    agp_key_enc: String,
+    agp_key_set_at: Date,
+    agp_key_set_by: String,
+    payment_provider: String, // 'autogopay' | 'pakasir' | kosong = otomatis
 });
 
 // =============================================================

@@ -11,6 +11,7 @@
 //     status asli ada di data.transaction_status. Hanya settlement yang success:true.
 // TIDAK ada retry otomatis: generate QRIS berulang dianggap spam dan bisa memblokir merchant.
 const axios = require("axios");
+const settings = require("./qris_settings");
 
 const BASE = "https://v1-gateway.autogopay.site";
 const PREFIX = "agp:";
@@ -18,15 +19,17 @@ const QR_LIFETIME_MS = 15 * 60 * 1000;
 
 const isAgpTxn = (txnId) => String(txnId || "").startsWith(PREFIX);
 
+// Key dari env AUTOGOPAY_API_KEY, atau yang disimpan owner lewat /setagpkey.
 function apiKey() {
-  const key = process.env.AUTOGOPAY_API_KEY;
-  if (!key) throw new Error("AUTOGOPAY_API_KEY belum diisi di .env");
+  const key = settings.apiKey();
+  if (!key) throw new Error("API key AutoGoPay belum diatur (env AUTOGOPAY_API_KEY atau /setagpkey)");
   return key;
 }
 
-async function call(path, body, timeout) {
+async function call(path, body, timeout, key) {
+  if (!key) await settings.ensureLoaded();
   const res = await axios.post(BASE + path, body, {
-    headers: { Authorization: `Bearer ${apiKey()}`, "Content-Type": "application/json" },
+    headers: { Authorization: `Bearer ${key || apiKey()}`, "Content-Type": "application/json" },
     timeout,
     maxRedirects: 0,
     validateStatus: () => true,
@@ -120,4 +123,19 @@ async function cancelTransaction(txnId) {
   }
 }
 
-module.exports = { createTransaction, checkPaymentStatus, cancelTransaction, isAgpTxn, expiryDate, PREFIX };
+/**
+ * Cek apakah key valid TANPA membuat QRIS: hanya membaca daftar transaksi (read-only).
+ * @returns {Promise<{ok:boolean, reason?:string}>}
+ */
+async function verifyKey(key) {
+  try {
+    const { http, data } = await call("/transactions", {}, 15000, key);
+    if (http === 200 && data.success === true) return { ok: true };
+    if (http === 401 || http === 403) return { ok: false, reason: data.message || "key ditolak AutoGoPay" };
+    return { ok: false, reason: `AutoGoPay membalas HTTP ${http}${data.message ? ": " + data.message : ""}` };
+  } catch (error) {
+    return { ok: false, reason: `tidak bisa menghubungi AutoGoPay (${error.message})` };
+  }
+}
+
+module.exports = { createTransaction, checkPaymentStatus, cancelTransaction, verifyKey, isAgpTxn, expiryDate, PREFIX };

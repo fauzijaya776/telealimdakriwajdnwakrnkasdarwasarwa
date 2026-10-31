@@ -1,19 +1,20 @@
 // qris_gateway.js — pemilih gateway QRIS (AutoGoPay / Pakasir) + aturan anti-blokir.
 //
-// Gateway untuk order BARU: PAYMENT_PROVIDER=autogopay | pakasir
-// (kosong -> autogopay kalau AUTOGOPAY_API_KEY diisi, selain itu pakasir).
+// Gateway untuk order BARU: PAYMENT_PROVIDER=autogopay | pakasir, atau diatur owner lewat
+// Telegram (/setagpkey, /agpgateway) bila env hosting tidak bisa diubah. Lihat qris_settings.js.
 // Order lama selalu dicek ke gateway pembuatnya: ID AutoGoPay berawalan "agp:".
 const pakasir = require("./qris_pakasir");
 const autogopay = require("./qris_autogopay");
+const settings = require("./qris_settings");
 
-function active() {
-  const p = String(process.env.PAYMENT_PROVIDER || "").trim().toLowerCase();
-  if (p === "autogopay" || p === "pakasir") return p;
-  return process.env.AUTOGOPAY_API_KEY ? "autogopay" : "pakasir";
+// Gateway order baru: env PAYMENT_PROVIDER -> /agpgateway (database) -> otomatis
+// (autogopay kalau ada API key dari env atau /setagpkey, selain itu pakasir).
+const active = () => settings.activeProvider();
+
+async function createTransaction(orderId, amount) {
+  await settings.ensureLoaded();
+  return (active() === "autogopay" ? autogopay : pakasir).createTransaction(orderId, amount);
 }
-
-const createTransaction = (orderId, amount) =>
-  (active() === "autogopay" ? autogopay : pakasir).createTransaction(orderId, amount);
 
 const checkPaymentStatus = (txnId) =>
   (autogopay.isAgpTxn(txnId) ? autogopay : pakasir).checkPaymentStatus(txnId);
