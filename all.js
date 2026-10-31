@@ -23,6 +23,7 @@ const dana = require('./qris_dana');
 const tokopay = require('./qris_tokopay');
 const qrin = require('./qris_qrin');
 const pakasir = require('./qris_pakasir');
+const qrisGw = require('./qris_gateway'); // AutoGoPay (utama) / Pakasir (cadangan) + anti-blokir
 const linkqu = require('./qris_linkqu');
 const adminModule = require('./admin');
 const QRCode = require('qrcode');
@@ -2255,6 +2256,23 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
 
     try {
         await ctx.deleteMessage().catch(() => {});
+        // Aturan anti-blokir (qris_gateway.js), SEBELUM stok ditahan & QRIS dibuat:
+        // satu tagihan aktif per pembeli, batas harian, jeda, rem darurat global.
+        const guard = await qrisGw.guardNewQris(Order, ctx.from.id);
+        if (guard.live || guard.error) {
+            await session.abortTransaction().catch(() => {});
+            transactionCommitted = true; // tidak ada stok yang ditahan; lewati pemulihan di catch
+            if (guard.brake) {
+                for (const ownerId of ownerIdList()) {
+                    await bot.telegram.sendMessage(ownerId, '🚨 [QRIS] Rem darurat aktif: pembuatan QRIS per menit melewati batas (kemungkinan serangan bot). Set PAYMENT_ENABLED=0 untuk menutup pembayaran.').catch(() => {});
+                }
+            }
+            const msg = guard.live
+                ? `⚠️ Kamu masih punya tagihan \`${guard.live.orderId}\` yang belum dibayar.\nBayar QRIS di atas, atau tekan *Batalkan Pembelian* dulu sebelum membuat tagihan baru.`
+                : `⚠️ ${guard.error}`;
+            await ctx.reply(msg, guard.live ? { parse_mode: 'Markdown', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('Batalkan Pembelian', `cancel_payment_pakasir_${guard.live.orderId}`)]]).reply_markup } : undefined).catch(() => {});
+            return;
+        }
         workingMsg = await ctx.reply('⏳ *Menyiapkan QRIS, mohon tunggu...*', { parse_mode: 'Markdown' });
 
         const product = await Product.findOne({ id: productId }).session(session);
@@ -2292,8 +2310,9 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         await session.commitTransaction();
         transactionCommitted = true;
 
-        const rawPayment = await pakasir.createTransaction(internalOrderId, totalHarga);
-        console.log('[PAKASIR] Invoice dibuat:', JSON.stringify({ order: internalOrderId, txn: rawPayment.txnId, amount: rawPayment.amount, fee: rawPayment.fee, total: rawPayment.totalBayar }));
+        // SATU kali panggil, tanpa retry (generate berulang dianggap spam oleh provider).
+        const rawPayment = await qrisGw.createTransaction(internalOrderId, totalHarga);
+        console.log('[QRIS] Invoice dibuat:', JSON.stringify({ order: internalOrderId, txn: rawPayment.txnId, amount: rawPayment.amount, fee: rawPayment.fee, total: rawPayment.totalBayar }));
 
         const payment = {
             displayOrderId: internalOrderId,
@@ -2304,12 +2323,17 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
             totalBayar: rawPayment.totalBayar,           // yang dibayar customer (sudah + fee)
             fee: rawPayment.fee,
         };
-        if (!payment.qrString) throw new Error("QR String tidak ditemukan dari response Pakasir");
+        if (!payment.qrString) throw new Error("QR String tidak ditemukan dari response gateway QRIS");
 
         await Order.updateOne(
             { orderId: internalOrderId },
             { $set: { pakasirTxnId: payment.txnId, fee: payment.fee, totalPaid: payment.totalBayar, depositId: payment.realOrderId } }
         );
+        const isAgp = qrisGw.isAgpTxn(payment.txnId);
+        const pollInterval = isAgp ? 10000 : 5000;
+        const pollDuration = isAgp
+            ? Math.min(20 * 60000, Math.max(5 * 60000, new Date(rawPayment.expiredAt).getTime() - Date.now()))
+            : 300000; // Pakasir: 5 menit (QRIS tetap bisa dibayar telat, ditangani sweeper)
 
         const qrDataURL = await QRCode.toDataURL(payment.qrString, {
             type: 'image/png', width: 512, margin: 2, errorCorrectionLevel: 'M',
@@ -2318,7 +2342,7 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         const qrBuffer = Buffer.from(qrDataURL.split(",")[1], "base64");
 
         // Nama produk/varian di-escape supaya karakter _ * ` [ tidak merusak format (invoice gagal tampil).
-        const caption = `📁 *Invoice Berhasil Dibuat*\n\`\`\`\n${payment.displayOrderId}\n\`\`\`\n────────────✧\n*QRIS SEMUA PEMBAYARAN*\n────────────✧\n*Informasi Item:*\n— Nama: ${escapeMd(String(product.name).toUpperCase())} - ${escapeMd(variant.name)}\n— Jumlah: ${quantity}x\n\n*Informasi Pembayaran:*\n— ID Transaksi: \`${payment.displayOrderId}\`\n— Harga: Rp ${Number(payment.amount).toLocaleString('id-ID')}\n— Biaya QRIS: Rp ${Number(payment.fee).toLocaleString('id-ID')}\n— Total Dibayar: Rp ${Number(payment.totalBayar).toLocaleString('id-ID')}\n— Kedaluwarsa dalam: 5 Menit`;
+        const caption = `📁 *Invoice Berhasil Dibuat*\n\`\`\`\n${payment.displayOrderId}\n\`\`\`\n────────────✧\n*QRIS SEMUA PEMBAYARAN*\n────────────✧\n*Informasi Item:*\n— Nama: ${escapeMd(String(product.name).toUpperCase())} - ${escapeMd(variant.name)}\n— Jumlah: ${quantity}x\n\n*Informasi Pembayaran:*\n— ID Transaksi: \`${payment.displayOrderId}\`\n— Harga: Rp ${Number(payment.amount).toLocaleString('id-ID')}\n${Number(payment.fee) > 0 ? `— Biaya QRIS: Rp ${Number(payment.fee).toLocaleString('id-ID')}\n` : ''}— Total Dibayar: Rp ${Number(payment.totalBayar).toLocaleString('id-ID')}\n— Kedaluwarsa dalam: ${Math.round(pollDuration / 60000)} Menit`;
         const keyboard = Markup.inlineKeyboard([[Markup.button.callback('Batalkan Pembelian', `cancel_payment_pakasir_${payment.displayOrderId}`)]]);
 
         await ctx.deleteMessage().catch(() => {});
@@ -2327,10 +2351,9 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         qrPhotoMsg = await ctx.replyWithPhoto({ source: qrBuffer }, { caption, parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
         await Order.updateOne({ orderId: internalOrderId }, { $set: { qrMsgId: qrPhotoMsg.message_id } }).catch(() => {});
 
-        // ===== KONFIRMASI VIA POLLING (tiap 5 detik, maks 5 menit) =====
+        // ===== KONFIRMASI VIA POLLING =====
         // Cadangan: sweepPakasirOrders() mengecek ulang tiap 2 menit (restart / bayar telat).
-        const pollInterval = 5000;
-        const pollDuration = 300000; // 5 menit
+        // AutoGoPay sudah memantau sendiri -> cukup tiap 10 detik, selama QRIS berlaku (±15 menit).
         let isHandled = false;       // timer sudah dihentikan (lunas / kedaluwarsa)
         let polling = false;         // cegah request cek status menumpuk
         const startedAt = Date.now();
@@ -2473,7 +2496,7 @@ async function fulfillPakasirPaidOrder(orderId) {
 async function pakasirStatusOf(txnId) {
     if (!txnId) return null;
     try {
-        const res = await pakasir.checkPaymentStatus(txnId);
+        const res = await qrisGw.checkPaymentStatus(txnId); // AutoGoPay (agp:) atau Pakasir
         const s = String((res && res.status) || '').toLowerCase();
         return s || null; // null = gagal cek (jaringan / rate limit)
     } catch (e) {
@@ -2658,7 +2681,7 @@ async function reconcilePakasirPendingOrders() {
         let fulfilled = 0;
         for (const o of pendings) {
             try {
-                const res = await pakasir.checkPaymentStatus(o.pakasirTxnId);
+                const res = await qrisGw.checkPaymentStatus(o.pakasirTxnId);
                 const status = String(res?.status || '').toLowerCase();
                 if (status === 'completed') {
                     const r = await fulfillPakasirPaidOrder(o.orderId);
@@ -2713,6 +2736,8 @@ bot.action(/^cancel_payment_pakasir_(.*)$/, async (ctx) => {
                 await Product.updateOne({ id: order.productId, "variants.slug": order.variantSlug }, { $push: { "variants.$.stock": { $each: order.reservedItems } }, $pull: { "variants.$.reserved_stock": { $in: order.reservedItems } } }).session(session);
             }
             await session.commitTransaction();
+            // AutoGoPay: batalkan juga di provider. Kalau gagal, pembayaran telat tetap dideteksi sweeper.
+            if (order.pakasirTxnId && qrisGw.isAgpTxn(order.pakasirTxnId)) await qrisGw.cancelTransaction(order.pakasirTxnId).catch(() => {});
             await ctx.reply('❌ Pesanan QRIS Anda telah berhasil dibatalkan.\nMohon JANGAN membayar QRIS yang sudah dibatalkan.').catch(() => {});
         } catch (dbError) {
             await session.abortTransaction().catch(() => {});
